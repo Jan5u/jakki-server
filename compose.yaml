@@ -1,0 +1,9 @@
+services:
+  jakkiserver:
+    build: .
+    container_name: jakki
+    restart: unless-stopped
+    ports:
+      - "7777:7777/udp"
+    volumes:
+      - ./jakkiserver_data:/jakkiserver_data

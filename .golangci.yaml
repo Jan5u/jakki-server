@@ -1,0 +1,19 @@
+version: "2"
+linters:
+  default: fast
+  enable:
+    - errcheck
+    - gocritic
+    - govet
+    - gosec
+    - iface
+    - sloglint
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  disable:
+    - depguard
+    - wsl
+    - mnd
+    - nlreturn

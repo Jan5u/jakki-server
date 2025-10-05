@@ -1,0 +1,5 @@
+.vscode
+.idea
+*.exe
+bin
+jakkiserver_data
