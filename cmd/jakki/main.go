@@ -79,7 +79,8 @@ func createTLSConfig() *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"jakki"},
-		ServerName:   "quictestserver",
+		ServerName:   "jakki",
+		MinVersion:   tls.VersionTLS12,
 	}
 }
 
