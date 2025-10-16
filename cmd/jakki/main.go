@@ -49,7 +49,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer listener.Close()
+	defer func() {
+		if err := listener.Close(); err != nil {
+			log.Printf("Error closing listener: %v", err)
+		}
+	}()
 
 	log.Printf("Listening on %s\n", addr)
 
@@ -73,10 +77,10 @@ func createTLSConfig() *tls.Config {
 	}
 
 	return &tls.Config{
-		Certificates:       []tls.Certificate{cert},
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"jakki"},
-		ServerName:         "quictestserver",
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"jakki"},
+		ServerName:   "jakki",
+		MinVersion:   tls.VersionTLS12,
 	}
 }
 
@@ -120,13 +124,19 @@ func handleConnection(conn *quic.Conn) {
 			go handleVoiceStream(stream)
 		default:
 			log.Printf("Unknown stream id: %d", stream.StreamID())
-			stream.Close()
+			if err := stream.Close(); err != nil {
+				log.Printf("Error closing unknown stream: %v", err)
+			}
 		}
 	}
 }
 
 func handleEventStream(stream *quic.Stream) {
-	defer stream.Close()
+	defer func() {
+		if err := stream.Close(); err != nil {
+			log.Printf("Error closing event stream: %v", err)
+		}
+	}()
 	mu.Lock()
 	eventStreams = append(eventStreams, stream)
 	mu.Unlock()
@@ -141,7 +151,10 @@ func handleEventStream(stream *quic.Stream) {
 		log.Println(err)
 	}
 	encjson = append(encjson, '\n')
-	stream.Write(encjson)
+	if _, err := stream.Write(encjson); err != nil {
+		log.Printf("Error writing server info: %v", err)
+		return
+	}
 
 	// handle incoming messages
 	buf := make([]byte, 7500000)
@@ -174,8 +187,6 @@ func handleVoiceStream(stream *quic.Stream) {
 	channel := msg
 	channelUserCount[channel]++
 	username := "user" + strconv.Itoa(channelUserCount[channel])
-
-	// TODO: add permission check
 
 	addStreamToChannel(channel, username, stream)
 	log.Printf("User %s joined %s", username, channel)
