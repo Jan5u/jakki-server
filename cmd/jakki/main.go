@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Jan5u/jakki-server/database"
 	"github.com/quic-go/quic-go"
 )
 
@@ -35,15 +36,49 @@ type voiceClient struct {
 }
 
 var (
+	db               *database.DB
 	channels         = make(map[string]map[string]*voiceClient)
 	channelUserCount = make(map[string]int)
 	eventStreams     []*quic.Stream
 	mu               sync.RWMutex
 )
 
+func loadChannelsFromDB() error {
+	allChannels, err := db.GetAllChannels()
+	if err != nil {
+		return err
+	}
+
+	for _, ch := range allChannels {
+		if ch.Type == database.ChannelTypeVoice {
+			mu.Lock()
+			if _, exists := channels[ch.Name]; !exists {
+				channels[ch.Name] = make(map[string]*voiceClient)
+			}
+			mu.Unlock()
+			log.Printf("Loaded voice channel: %s", ch.Name)
+		} else {
+			log.Printf("Loaded text channel: %s", ch.Name)
+		}
+	}
+
+	return nil
+}
+
 func main() {
-	channels["#channel1"] = make(map[string]*voiceClient)
-	channels["channel2"] = make(map[string]*voiceClient)
+	dataDir := getDataDir()
+	var err error
+	db, err = database.New(dataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+
+	if err := loadChannelsFromDB(); err != nil {
+		_ = db.Close()
+		log.Fatalf("Failed to load channels: %v", err)
+	}
+
+	defer func() { _ = db.Close() }()
 
 	listener, err := quic.ListenAddr(addr, createTLSConfig(), nil)
 	if err != nil {
@@ -141,10 +176,16 @@ func handleEventStream(stream *quic.Stream) {
 	eventStreams = append(eventStreams, stream)
 	mu.Unlock()
 
-	// send example server info
+	// Send server info with channels from database
+	channelNames, err := db.GetAllChannelNames()
+	if err != nil {
+		log.Printf("Error getting channel names: %v", err)
+		return
+	}
+
 	data := &ServerInfo{
 		EventType: "ServerInfo",
-		Channels:  []string{"#channel1", "channel2"},
+		Channels:  channelNames,
 	}
 	encjson, err := json.Marshal(data)
 	if err != nil {
@@ -185,6 +226,19 @@ func handleVoiceStream(stream *quic.Stream) {
 	log.Printf("Received from voice stream: %s", msg)
 
 	channel := msg
+
+	// check if channel exists
+	mu.RLock()
+	_, exists := channels[channel]
+	mu.RUnlock()
+
+	if !exists {
+		log.Printf("Voice channel not found: %s", channel)
+		_, _ = stream.Write([]byte("error:channel not found"))
+		_ = stream.Close()
+		return
+	}
+
 	channelUserCount[channel]++
 	username := "user" + strconv.Itoa(channelUserCount[channel])
 
