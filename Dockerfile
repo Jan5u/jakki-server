@@ -3,6 +3,7 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
+COPY database/ database/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/jakkiserver cmd/jakki/main.go
 
 
