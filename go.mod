@@ -1,6 +1,6 @@
 module github.com/Jan5u/jakki-server
 
-go 1.25.1
+go 1.25.4
 
 require (
 	github.com/golang-migrate/migrate/v4 v4.19.0
