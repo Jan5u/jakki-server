@@ -38,8 +38,9 @@ type Server struct {
 	listener *quic.Listener
 	db       *database.DB
 
-	// Voice channel management
-	channels         map[string]map[string]*voiceClient
+	// Channel management
+	voiceChannels    map[string]map[string]*voiceClient
+	textChannels     map[string]bool
 	channelUserCount map[string]int
 	eventStreams     []*quic.Stream
 	mu               sync.RWMutex
@@ -49,7 +50,8 @@ func NewServer(addr string, db *database.DB) *Server {
 	return &Server{
 		addr:             addr,
 		db:               db,
-		channels:         make(map[string]map[string]*voiceClient),
+		voiceChannels:    make(map[string]map[string]*voiceClient),
+		textChannels:     make(map[string]bool),
 		channelUserCount: make(map[string]int),
 		eventStreams:     make([]*quic.Stream, 0),
 	}
@@ -82,12 +84,15 @@ func (s *Server) LoadChannels() error {
 	for _, ch := range allChannels {
 		if ch.Type == database.ChannelTypeVoice {
 			s.mu.Lock()
-			if _, exists := s.channels[ch.Name]; !exists {
-				s.channels[ch.Name] = make(map[string]*voiceClient)
+			if _, exists := s.voiceChannels[ch.Name]; !exists {
+				s.voiceChannels[ch.Name] = make(map[string]*voiceClient)
 			}
 			s.mu.Unlock()
 			log.Printf("Loaded voice channel: %s", ch.Name)
 		} else {
+			s.mu.Lock()
+			s.textChannels[ch.Name] = true
+			s.mu.Unlock()
 			log.Printf("Loaded text channel: %s", ch.Name)
 		}
 	}
@@ -233,7 +238,7 @@ func (s *Server) handleVoiceStream(stream *quic.Stream) {
 
 	// check if channel exists
 	s.mu.RLock()
-	_, exists := s.channels[channel]
+	_, exists := s.voiceChannels[channel]
 	s.mu.RUnlock()
 
 	if !exists {
@@ -294,7 +299,7 @@ func (s *Server) broadcastVoiceToChannel(channel, sender string, data []byte) {
 	copy(packet[4:], data)
 
 	s.mu.RLock()
-	channelStreams, exists := s.channels[channel]
+	channelStreams, exists := s.voiceChannels[channel]
 	if !exists {
 		s.mu.RUnlock()
 		return
@@ -327,10 +332,10 @@ func (s *Server) addStreamToChannel(channel, user string, stream *quic.Stream) *
 	}
 
 	s.mu.Lock()
-	if _, ok := s.channels[channel]; !ok {
-		s.channels[channel] = make(map[string]*voiceClient)
+	if _, ok := s.voiceChannels[channel]; !ok {
+		s.voiceChannels[channel] = make(map[string]*voiceClient)
 	}
-	s.channels[channel][user] = vc
+	s.voiceChannels[channel][user] = vc
 	s.mu.Unlock()
 
 	log.Printf("Added stream for user %s to channel %s", user, channel)
@@ -365,7 +370,7 @@ func (s *Server) voiceWriterLoop(channel string, vc *voiceClient) {
 func (s *Server) removeVoiceClient(channel, user string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if channelStreams, ok := s.channels[channel]; ok {
+	if channelStreams, ok := s.voiceChannels[channel]; ok {
 		if vc, exists := channelStreams[user]; exists {
 			delete(channelStreams, user)
 			_ = vc.stream.Close()
@@ -373,7 +378,7 @@ func (s *Server) removeVoiceClient(channel, user string) {
 			log.Printf("Removed voice client user=%s from channel=%s", user, channel)
 		}
 		if len(channelStreams) == 0 {
-			delete(s.channels, channel)
+			delete(s.voiceChannels, channel)
 		}
 	}
 }
