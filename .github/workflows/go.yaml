@@ -42,3 +42,11 @@ jobs:
         go-version-file: ./go.mod
     - name: Build
       run: go build -v ./...
+
+  docker-build:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag jan5u/jakki:latest
