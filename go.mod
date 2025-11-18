@@ -5,7 +5,7 @@ go 1.25.1
 require (
 	github.com/golang-migrate/migrate/v4 v4.19.0
 	github.com/quic-go/quic-go v0.55.0
-	modernc.org/sqlite v1.39.1
+	modernc.org/sqlite v1.40.1
 )
 
 require (
