@@ -3,4 +3,11 @@ updates:
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "sunday"
+      time: "09:00"
+      timezone: "UTC"
+    groups:
+      all:
+        patterns:
+          - "*"
