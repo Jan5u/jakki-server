@@ -32,19 +32,8 @@ jobs:
     - name: Test
       run: go test -race -v ./...
 
-  build:
-    needs: [lint, test]
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v5
-    - uses: actions/setup-go@v6
-      with:
-        go-version-file: ./go.mod
-    - name: Build
-      run: go build -v ./...
-
   docker-build:
-    needs: build
+    needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
