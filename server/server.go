@@ -58,7 +58,11 @@ func NewServer(addr string, db *database.DB) *Server {
 }
 
 func (s *Server) RunServer() error {
-	listener, err := quic.ListenAddr(s.addr, createTLSConfig(), nil)
+	tlsConfig, err := createTLSConfig()
+	if err != nil {
+		return err
+	}
+	listener, err := quic.ListenAddr(s.addr, tlsConfig, nil)
 	if err != nil {
 		return err
 	}
@@ -126,13 +130,13 @@ func GetDataDir() string {
 	return localPath
 }
 
-func createTLSConfig() *tls.Config {
+func createTLSConfig() (*tls.Config, error) {
 	dataDir := GetDataDir()
 	certPath := filepath.Join(dataDir, "cert.pem")
 	keyPath := filepath.Join(dataDir, "key.pem")
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		log.Fatalf("Failed to createTLSConfig: %v", err)
+		return nil, err
 	}
 
 	return &tls.Config{
@@ -140,7 +144,7 @@ func createTLSConfig() *tls.Config {
 		NextProtos:   []string{"jakki"},
 		ServerName:   "jakki",
 		MinVersion:   tls.VersionTLS12,
-	}
+	}, nil
 }
 
 func (s *Server) acceptStreamLoop(listener *quic.Listener) {

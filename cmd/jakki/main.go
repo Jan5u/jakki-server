@@ -28,9 +28,10 @@ func main() {
 	}
 
 	// run server
+	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.RunServer(); err != nil {
-			log.Fatalf("Server error: %v", err)
+			errCh <- err
 		}
 	}()
 	log.Printf("Listening on %s\n", addr)
@@ -38,9 +39,14 @@ func main() {
 	// wait for sigterm
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
 
-	log.Println("Shutting down server...")
+	select {
+	case <-quit:
+		log.Println("Shutting down server...")
+	case err := <-errCh:
+		log.Printf("Server error: %v\n", err)
+	}
+
 	if err := srv.Stop(); err != nil {
 		log.Printf("Error stopping server: %v", err)
 	}
