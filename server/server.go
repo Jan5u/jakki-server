@@ -2,12 +2,15 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"log"
 	"log/slog"
+	"math/big"
 	"os"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -131,19 +134,28 @@ func GetDataDir() string {
 }
 
 func createTLSConfig() (*tls.Config, error) {
-	dataDir := GetDataDir()
-	certPath := filepath.Join(dataDir, "cert.pem")
-	keyPath := filepath.Join(dataDir, "key.pem")
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, priv.Public(), priv)
 	if err != nil {
 		return nil, err
 	}
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"jakki"},
-		ServerName:   "jakki",
-		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{certDER},
+			PrivateKey:  priv,
+		}},
+		NextProtos: []string{"jakki"},
+		ServerName: "jakki",
+		MinVersion: tls.VersionTLS13,
 	}, nil
 }
 
