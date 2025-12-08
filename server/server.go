@@ -578,9 +578,17 @@ func (s *Server) sendAdminResponse(stream *quic.Stream, response *AdminResponse)
 	}
 
 	jsonData = append(jsonData, '\n')
+
+	if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("Error setting write deadline: %v", err)
+		return
+	}
+
 	if _, err := stream.Write(jsonData); err != nil {
 		log.Printf("Error writing admin response: %v", err)
 	}
+
+	_ = stream.SetWriteDeadline(time.Time{})
 }
 
 func (s *Server) handleVoiceStream(conn *quic.Conn, stream *quic.Stream) {
