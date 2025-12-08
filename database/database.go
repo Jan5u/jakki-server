@@ -23,21 +23,21 @@ const (
 )
 
 type Channel struct {
-	ID          int         `db:"id" json:"id"`
-	Name        string      `db:"name" json:"name"`
-	Type        ChannelType `db:"type" json:"type"`
+	ID          int         `db:"id"          json:"id"`
+	Name        string      `db:"name"        json:"name"`
+	Type        ChannelType `db:"type"        json:"type"`
 	Description string      `db:"description" json:"description,omitempty"`
-	CreatedAt   string      `db:"created_at" json:"created_at"`
+	CreatedAt   string      `db:"created_at"  json:"created_at"`
 }
 
 type User struct {
-	ID         int    `db:"id" json:"id"`
-	Username   string `db:"username" json:"username"`
-	PublicKey  string `db:"public_key" json:"public_key"`
-	IsAdmin    bool   `db:"is_admin" json:"is_admin"`
+	ID         int    `db:"id"          json:"id"`
+	Username   string `db:"username"    json:"username"`
+	PublicKey  string `db:"public_key"  json:"public_key"`
+	IsAdmin    bool   `db:"is_admin"    json:"is_admin"`
 	IsApproved bool   `db:"is_approved" json:"is_approved"`
-	CreatedAt  string `db:"created_at" json:"created_at"`
-	LastAuth   string `db:"last_auth" json:"last_auth"`
+	CreatedAt  string `db:"created_at"  json:"created_at"`
+	LastAuth   string `db:"last_auth"   json:"last_auth"`
 }
 
 type rawUser struct {
@@ -103,7 +103,7 @@ func (db *DB) Close() error {
 
 func (db *DB) GetChannelByName(name string) (*Channel, error) {
 	var ch Channel
-	err := db.conn.Get(&ch, "SELECT * FROM channels WHERE name = ?", name)
+	err := db.conn.Get(&ch, "SELECT id, name, type, description, created_at FROM channels WHERE name = ?", name)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +118,7 @@ func (db *DB) GetAllChannelNames() ([]string, error) {
 
 func (db *DB) GetAllChannels() ([]Channel, error) {
 	var channels []Channel
-	err := db.conn.Select(&channels, "SELECT * FROM channels ORDER BY type, name")
+	err := db.conn.Select(&channels, "SELECT id, name, type, description, created_at FROM channels ORDER BY type, name")
 	return channels, err
 }
 
@@ -135,7 +135,7 @@ func (db *DB) DeleteChannel(name string) error {
 
 func (db *DB) GetUserByUsernameAndPublicKey(username, pubKey string) (*User, error) {
 	var raw rawUser
-	err := db.conn.Get(&raw, "SELECT * FROM users WHERE username = ? AND public_key = ?", username, pubKey)
+	err := db.conn.Get(&raw, "SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE username = ? AND public_key = ?", username, pubKey)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,7 @@ func (db *DB) GetUserByUsernameAndPublicKey(username, pubKey string) (*User, err
 
 func (db *DB) GetUserByPublicKey(pubKey string) (*User, error) {
 	var raw rawUser
-	err := db.conn.Get(&raw, "SELECT * FROM users WHERE public_key = ?", pubKey)
+	err := db.conn.Get(&raw, "SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE public_key = ?", pubKey)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func (db *DB) GetUserByPublicKey(pubKey string) (*User, error) {
 
 func (db *DB) GetUsersByUsername(username string) ([]User, error) {
 	var rawUsers []rawUser
-	err := db.conn.Select(&rawUsers, "SELECT * FROM users WHERE username = ?", username)
+	err := db.conn.Select(&rawUsers, "SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE username = ?", username)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +208,7 @@ func (db *DB) HasAnyUsers() (bool, error) {
 
 func (db *DB) GetPendingUsers() ([]User, error) {
 	var rawUsers []rawUser
-	err := db.conn.Select(&rawUsers, "SELECT * FROM users WHERE is_approved = 0 ORDER BY created_at")
+	err := db.conn.Select(&rawUsers, "SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE is_approved = 0 ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +233,7 @@ func (db *DB) ApproveUserByID(userID int) error {
 
 func (db *DB) GetAllUsers() ([]User, error) {
 	var rawUsers []rawUser
-	err := db.conn.Select(&rawUsers, "SELECT * FROM users ORDER BY created_at")
+	err := db.conn.Select(&rawUsers, "SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
