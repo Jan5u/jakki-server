@@ -244,158 +244,18 @@ func (s *Server) handleAuthStream(conn *quic.Conn, stream *quic.Stream) {
 	}()
 
 	connID := fmt.Sprintf("%p", conn)
-
-	challenge := make([]byte, 32)
-	if _, err := rand.Read(challenge); err != nil {
-		log.Printf("Failed to generate challenge: %v", err)
-		_, _ = stream.Write([]byte("error:internal server error"))
-		return
-	}
-
-	s.mu.Lock()
-	s.pendingChallenges[connID] = challenge
-	s.mu.Unlock()
-
-	challengeHex := hex.EncodeToString(challenge)
-	if _, err := stream.Write([]byte(challengeHex)); err != nil {
-		log.Printf("Failed to send challenge: %v", err)
-		return
-	}
-
-	// wait for response
-	buf := make([]byte, 8192)
-	n, err := stream.Read(buf)
+	challenge, err := s.sendAuthChallenge(connID, stream)
 	if err != nil {
-		log.Printf("Failed to read auth response: %v", err)
-		s.mu.Lock()
-		delete(s.pendingChallenges, connID)
-		s.mu.Unlock()
 		return
 	}
 
-	// username:publicKey_hex:signature_hex
-	response := string(buf[:n])
-	parts := strings.SplitN(response, ":", 3)
-	if len(parts) != 3 {
-		log.Printf("Invalid auth response format: got %d parts, expected 3. Response: %q (len=%d)", len(parts), response, len(response))
-		_, _ = stream.Write([]byte("error:invalid format"))
-		s.mu.Lock()
-		delete(s.pendingChallenges, connID)
-		s.mu.Unlock()
+	username, pubKeyHex, err := s.readAndVerifyAuthResponse(connID, stream, challenge)
+	if err != nil {
 		return
 	}
 
-	username := parts[0]
-	pubKeyHex := parts[1]
-	signatureHex := parts[2]
-
-	if err := validateUsername(username); err != nil {
-		log.Printf("Invalid username: %v", err)
-		_, _ = stream.Write([]byte(fmt.Sprintf("error:%v", err)))
-		s.mu.Lock()
-		delete(s.pendingChallenges, connID)
-		s.mu.Unlock()
+	if err := s.authenticateOrCreateUser(connID, stream, username, pubKeyHex); err != nil {
 		return
-	}
-
-	pubKey, err := hex.DecodeString(pubKeyHex)
-	if err != nil || len(pubKey) != ed25519.PublicKeySize {
-		log.Printf("Invalid public key: %v", err)
-		_, _ = stream.Write([]byte("error:invalid public key"))
-		s.mu.Lock()
-		delete(s.pendingChallenges, connID)
-		s.mu.Unlock()
-		return
-	}
-
-	signature, err := hex.DecodeString(signatureHex)
-	if err != nil || len(signature) != ed25519.SignatureSize {
-		log.Printf("Invalid signature: %v", err)
-		_, _ = stream.Write([]byte("error:invalid signature"))
-		s.mu.Lock()
-		delete(s.pendingChallenges, connID)
-		s.mu.Unlock()
-		return
-	}
-
-	s.mu.RLock()
-	storedChallenge, exists := s.pendingChallenges[connID]
-	s.mu.RUnlock()
-
-	if !exists {
-		log.Printf("Challenge not found for connection")
-		_, _ = stream.Write([]byte("error:challenge expired"))
-		return
-	}
-
-	if !ed25519.Verify(ed25519.PublicKey(pubKey), storedChallenge, signature) {
-		log.Printf("Signature verification failed")
-		_, _ = stream.Write([]byte("error:authentication failed"))
-		s.mu.Lock()
-		delete(s.pendingChallenges, connID)
-		s.mu.Unlock()
-		return
-	}
-
-	existingUser, userErr := s.db.GetUserByUsernameAndPublicKey(username, pubKeyHex)
-	if userErr == nil {
-		if !existingUser.IsApproved {
-			log.Printf("User %s not yet approved by admin", username)
-			_, _ = stream.Write([]byte("error:pending approval"))
-			s.mu.Lock()
-			delete(s.pendingChallenges, connID)
-			s.mu.Unlock()
-			return
-		}
-		if err := s.db.UpdateLastAuth(pubKeyHex); err != nil {
-			log.Printf("Failed to update last auth: %v", err)
-		}
-	} else {
-		isAvailable, err := s.db.IsUsernameAvailable(username)
-		if err != nil {
-			log.Printf("Failed to check username availability: %v", err)
-			_, _ = stream.Write([]byte("error:internal server error"))
-			s.mu.Lock()
-			delete(s.pendingChallenges, connID)
-			s.mu.Unlock()
-			return
-		}
-
-		if !isAvailable {
-			log.Printf("Username already taken: %s", username)
-			_, _ = stream.Write([]byte("error:username already taken"))
-			s.mu.Lock()
-			delete(s.pendingChallenges, connID)
-			s.mu.Unlock()
-			return
-		}
-
-		// set first user as admin
-		s.mu.Lock()
-		isAdmin := !s.hasInitialAdmin
-		if isAdmin {
-			s.hasInitialAdmin = true
-			log.Printf("Creating first user as admin: %s", username)
-		}
-		s.mu.Unlock()
-
-		if err := s.db.CreateUser(username, pubKeyHex, isAdmin); err != nil {
-			log.Printf("Failed to create user: %v", err)
-			_, _ = stream.Write([]byte("error:failed to create user"))
-			s.mu.Lock()
-			delete(s.pendingChallenges, connID)
-			s.mu.Unlock()
-			return
-		}
-
-		if !isAdmin {
-			log.Printf("New user %s created, pending admin approval", username)
-			_, _ = stream.Write([]byte("error:pending approval"))
-			s.mu.Lock()
-			delete(s.pendingChallenges, connID)
-			s.mu.Unlock()
-			return
-		}
 	}
 
 	s.mu.Lock()
@@ -409,6 +269,162 @@ func (s *Server) handleAuthStream(conn *quic.Conn, stream *quic.Stream) {
 	if _, err := stream.Write([]byte("ok")); err != nil {
 		log.Printf("Failed to send ok response: %v", err)
 	}
+}
+
+func (s *Server) sendAuthChallenge(connID string, stream *quic.Stream) ([]byte, error) {
+	challenge := make([]byte, 32)
+	if _, err := rand.Read(challenge); err != nil {
+		log.Printf("Failed to generate challenge: %v", err)
+		_, _ = stream.Write([]byte("error:internal server error"))
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.pendingChallenges[connID] = challenge
+	s.mu.Unlock()
+
+	challengeHex := hex.EncodeToString(challenge)
+	if _, err := stream.Write([]byte(challengeHex)); err != nil {
+		log.Printf("Failed to send challenge: %v", err)
+		return nil, err
+	}
+
+	return challenge, nil
+}
+
+func (s *Server) readAndVerifyAuthResponse(connID string, stream *quic.Stream, challenge []byte) (string, string, error) {
+	buf := make([]byte, 8192)
+	n, err := stream.Read(buf)
+	if err != nil {
+		log.Printf("Failed to read auth response: %v", err)
+		s.cleanupChallenge(connID)
+		return "", "", err
+	}
+
+	username, pubKeyHex, signatureHex, err := s.parseAuthResponse(string(buf[:n]))
+	if err != nil {
+		_, _ = stream.Write([]byte("error:" + err.Error()))
+		s.cleanupChallenge(connID)
+		return "", "", err
+	}
+
+	if err := s.verifySignature(pubKeyHex, signatureHex, challenge); err != nil {
+		_, _ = stream.Write([]byte("error:" + err.Error()))
+		s.cleanupChallenge(connID)
+		return "", "", err
+	}
+
+	return username, pubKeyHex, nil
+}
+
+func (s *Server) parseAuthResponse(response string) (string, string, string, error) {
+	parts := strings.SplitN(response, ":", 3)
+	if len(parts) != 3 {
+		log.Printf("Invalid auth response format: got %d parts, expected 3", len(parts))
+		return "", "", "", errors.New("invalid format")
+	}
+
+	username := parts[0]
+	if err := validateUsername(username); err != nil {
+		log.Printf("Invalid username: %v", err)
+		return "", "", "", err
+	}
+
+	return username, parts[1], parts[2], nil
+}
+
+func (s *Server) verifySignature(pubKeyHex, signatureHex string, challenge []byte) error {
+	pubKey, err := hex.DecodeString(pubKeyHex)
+	if err != nil || len(pubKey) != ed25519.PublicKeySize {
+		log.Printf("Invalid public key: %v", err)
+		return errors.New("invalid public key")
+	}
+
+	signature, err := hex.DecodeString(signatureHex)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		log.Printf("Invalid signature: %v", err)
+		return errors.New("invalid signature")
+	}
+
+	if !ed25519.Verify(ed25519.PublicKey(pubKey), challenge, signature) {
+		log.Printf("Signature verification failed")
+		return errors.New("authentication failed")
+	}
+
+	return nil
+}
+
+func (s *Server) authenticateOrCreateUser(connID string, stream *quic.Stream, username, pubKeyHex string) error {
+	existingUser, userErr := s.db.GetUserByUsernameAndPublicKey(username, pubKeyHex)
+	if userErr == nil {
+		return s.handleExistingUser(connID, stream, existingUser, pubKeyHex)
+	}
+	return s.handleNewUser(connID, stream, username, pubKeyHex)
+}
+
+func (s *Server) handleExistingUser(connID string, stream *quic.Stream, user *database.User, pubKeyHex string) error {
+	if !user.IsApproved {
+		log.Printf("User %s not yet approved by admin", user.Username)
+		_, _ = stream.Write([]byte("error:pending approval"))
+		s.cleanupChallenge(connID)
+		return errors.New("pending approval")
+	}
+	if err := s.db.UpdateLastAuth(pubKeyHex); err != nil {
+		log.Printf("Failed to update last auth: %v", err)
+	}
+	return nil
+}
+
+func (s *Server) handleNewUser(connID string, stream *quic.Stream, username, pubKeyHex string) error {
+	isAvailable, err := s.db.IsUsernameAvailable(username)
+	if err != nil {
+		log.Printf("Failed to check username availability: %v", err)
+		_, _ = stream.Write([]byte("error:internal server error"))
+		s.cleanupChallenge(connID)
+		return err
+	}
+
+	if !isAvailable {
+		log.Printf("Username already taken: %s", username)
+		_, _ = stream.Write([]byte("error:username already taken"))
+		s.cleanupChallenge(connID)
+		return errors.New("username already taken")
+	}
+
+	isAdmin := s.checkAndSetFirstAdmin(username)
+
+	if err := s.db.CreateUser(username, pubKeyHex, isAdmin); err != nil {
+		log.Printf("Failed to create user: %v", err)
+		_, _ = stream.Write([]byte("error:failed to create user"))
+		s.cleanupChallenge(connID)
+		return err
+	}
+
+	if !isAdmin {
+		log.Printf("New user %s created, pending admin approval", username)
+		_, _ = stream.Write([]byte("error:pending approval"))
+		s.cleanupChallenge(connID)
+		return errors.New("pending approval")
+	}
+
+	return nil
+}
+
+func (s *Server) checkAndSetFirstAdmin(username string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	isAdmin := !s.hasInitialAdmin
+	if isAdmin {
+		s.hasInitialAdmin = true
+		log.Printf("Creating first user as admin: %s", username)
+	}
+	return isAdmin
+}
+
+func (s *Server) cleanupChallenge(connID string) {
+	s.mu.Lock()
+	delete(s.pendingChallenges, connID)
+	s.mu.Unlock()
 }
 
 func validateUsername(username string) error {
@@ -592,8 +608,25 @@ func (s *Server) sendAdminResponse(stream *quic.Stream, response *AdminResponse)
 }
 
 func (s *Server) handleVoiceStream(conn *quic.Conn, stream *quic.Stream) {
-	// authenticate
 	connID := fmt.Sprintf("%p", conn)
+	username, err := s.authenticateVoiceStream(connID, stream)
+	if err != nil {
+		return
+	}
+
+	channel, err := s.readChannelName(stream)
+	if err != nil {
+		return
+	}
+
+	if err := s.joinVoiceChannel(channel, username, stream); err != nil {
+		return
+	}
+
+	s.handleVoicePackets(stream, channel, username)
+}
+
+func (s *Server) authenticateVoiceStream(connID string, stream *quic.Stream) (string, error) {
 	s.mu.RLock()
 	username, authenticated := s.authenticatedConns[connID]
 	s.mu.RUnlock()
@@ -602,25 +635,25 @@ func (s *Server) handleVoiceStream(conn *quic.Conn, stream *quic.Stream) {
 		log.Printf("Unauthenticated connection attempted to access voice stream")
 		_, _ = stream.Write([]byte("error:not authenticated"))
 		_ = stream.Close()
-		return
+		return "", errors.New("not authenticated")
 	}
+	return username, nil
+}
 
+func (s *Server) readChannelName(stream *quic.Stream) (string, error) {
 	buf := make([]byte, 8192)
-
-	// when voice stream is created read from stream which channel to join
 	n, err := stream.Read(buf)
 	if err != nil {
 		log.Printf("Read error: %v", err)
-		return
+		return "", err
 	}
 	log.Printf("Read %d bytes from voice stream", n)
+	channel := string(buf[:n])
+	log.Printf("Received from voice stream: %s", channel)
+	return channel, nil
+}
 
-	msg := string(buf[:n])
-	log.Printf("Received from voice stream: %s", msg)
-
-	channel := msg
-
-	// check if channel exists
+func (s *Server) joinVoiceChannel(channel, username string, stream *quic.Stream) error {
 	s.mu.RLock()
 	_, exists := s.voiceChannels[channel]
 	s.mu.RUnlock()
@@ -629,16 +662,17 @@ func (s *Server) handleVoiceStream(conn *quic.Conn, stream *quic.Stream) {
 		log.Printf("Voice channel not found: %s", channel)
 		_, _ = stream.Write([]byte("error:channel not found"))
 		_ = stream.Close()
-		return
+		return errors.New("channel not found")
 	}
 
 	s.addStreamToChannel(channel, username, stream)
 	log.Printf("User %s joined %s", username, channel)
-
-	// send ok for voice packets
 	s.sendOkMessage(stream)
+	return nil
+}
 
-	// wait for voice packets
+func (s *Server) handleVoicePackets(stream *quic.Stream, channel, username string) {
+	buf := make([]byte, 8192)
 	for {
 		n, err := stream.Read(buf)
 		if err != nil {
@@ -647,19 +681,19 @@ func (s *Server) handleVoiceStream(conn *quic.Conn, stream *quic.Stream) {
 		}
 		log.Printf("Read %d bytes from voice stream", n)
 
-		// combine username with payload using a delimiter
-		usernameBytes := []byte(username)
-		delimiter := []byte(":")
-
-		// create combined message: [username][delimiter][payload]
-		combined := make([]byte, len(usernameBytes)+len(delimiter)+n)
-		copy(combined, usernameBytes)
-		copy(combined[len(usernameBytes):], delimiter)
-		copy(combined[len(usernameBytes)+len(delimiter):], buf[:n])
-
-		// broadcast to other users in the same channel
+		combined := s.createVoicePacket(username, buf[:n])
 		s.broadcastVoiceToChannel(channel, username, combined)
 	}
+}
+
+func (s *Server) createVoicePacket(username string, payload []byte) []byte {
+	usernameBytes := []byte(username)
+	delimiter := []byte(":")
+	combined := make([]byte, len(usernameBytes)+len(delimiter)+len(payload))
+	copy(combined, usernameBytes)
+	copy(combined[len(usernameBytes):], delimiter)
+	copy(combined[len(usernameBytes)+len(delimiter):], payload)
+	return combined
 }
 
 func (s *Server) sendOkMessage(stream *quic.Stream) {
@@ -709,7 +743,7 @@ func (s *Server) addStreamToChannel(channel, user string, stream *quic.Stream) *
 	vc := &voiceClient{
 		user:   user,
 		stream: stream,
-		send:   make(chan []byte, 32), // small buffer; tune as needed
+		send:   make(chan []byte, 32),
 	}
 
 	s.mu.Lock()
