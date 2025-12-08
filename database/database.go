@@ -1,7 +1,6 @@
 package database
 
 import (
-	"database/sql"
 	"embed"
 	"log"
 	"path/filepath"
@@ -9,6 +8,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
 )
 
@@ -23,43 +23,70 @@ const (
 )
 
 type Channel struct {
-	ID          int         `json:"id"`
-	Name        string      `json:"name"`
-	Type        ChannelType `json:"type"`
-	Description string      `json:"description,omitempty"`
-	CreatedAt   string      `json:"created_at"`
+	ID          int         `db:"id" json:"id"`
+	Name        string      `db:"name" json:"name"`
+	Type        ChannelType `db:"type" json:"type"`
+	Description string      `db:"description" json:"description,omitempty"`
+	CreatedAt   string      `db:"created_at" json:"created_at"`
 }
 
 type User struct {
-	ID         int    `json:"id"`
-	Username   string `json:"username"`
-	PublicKey  string `json:"public_key"`
-	IsAdmin    bool   `json:"is_admin"`
-	IsApproved bool   `json:"is_approved"`
-	CreatedAt  string `json:"created_at"`
-	LastAuth   string `json:"last_auth"`
+	ID         int    `db:"id" json:"id"`
+	Username   string `db:"username" json:"username"`
+	PublicKey  string `db:"public_key" json:"public_key"`
+	IsAdmin    bool   `db:"is_admin" json:"is_admin"`
+	IsApproved bool   `db:"is_approved" json:"is_approved"`
+	CreatedAt  string `db:"created_at" json:"created_at"`
+	LastAuth   string `db:"last_auth" json:"last_auth"`
+}
+
+type rawUser struct {
+	ID         int    `db:"id"`
+	Username   string `db:"username"`
+	PublicKey  string `db:"public_key"`
+	IsAdmin    int    `db:"is_admin"`
+	IsApproved int    `db:"is_approved"`
+	CreatedAt  string `db:"created_at"`
+	LastAuth   string `db:"last_auth"`
+}
+
+func (r *rawUser) toUser() *User {
+	return &User{
+		ID:         r.ID,
+		Username:   r.Username,
+		PublicKey:  r.PublicKey,
+		IsAdmin:    r.IsAdmin == 1,
+		IsApproved: r.IsApproved == 1,
+		CreatedAt:  r.CreatedAt,
+		LastAuth:   r.LastAuth,
+	}
+}
+
+func rawUsersToUsers(rawUsers []rawUser) []User {
+	users := make([]User, len(rawUsers))
+	for i, ru := range rawUsers {
+		users[i] = *ru.toUser()
+	}
+	return users
 }
 
 type DB struct {
-	conn *sql.DB
+	conn *sqlx.DB
 }
 
 func New(dataDir string) (*DB, error) {
 	dbPath := filepath.Join(dataDir, "jakki.db")
-	conn, err := sql.Open("sqlite", dbPath)
+	conn, err := sqlx.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
+	conn.MapperFunc(func(s string) string { return s })
 	if _, err := conn.Exec("PRAGMA journal_mode = WAL"); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 	db := &DB{conn: conn}
 	if err := db.runMigrations(); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if err := db.CreateUsersTable(); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -76,8 +103,7 @@ func (db *DB) Close() error {
 
 func (db *DB) GetChannelByName(name string) (*Channel, error) {
 	var ch Channel
-	err := db.conn.QueryRow("SELECT id, name, type, description, created_at FROM channels WHERE name = ?", name).
-		Scan(&ch.ID, &ch.Name, &ch.Type, &ch.Description, &ch.CreatedAt)
+	err := db.conn.Get(&ch, "SELECT * FROM channels WHERE name = ?", name)
 	if err != nil {
 		return nil, err
 	}
@@ -85,40 +111,15 @@ func (db *DB) GetChannelByName(name string) (*Channel, error) {
 }
 
 func (db *DB) GetAllChannelNames() ([]string, error) {
-	rows, err := db.conn.Query("SELECT name FROM channels ORDER BY type, name")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
 	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
+	err := db.conn.Select(&names, "SELECT name FROM channels ORDER BY type, name")
+	return names, err
 }
 
 func (db *DB) GetAllChannels() ([]Channel, error) {
-	rows, err := db.conn.Query("SELECT id, name, type, description, created_at FROM channels ORDER BY type, name")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
 	var channels []Channel
-	for rows.Next() {
-		var ch Channel
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Type, &ch.Description, &ch.CreatedAt); err != nil {
-			return nil, err
-		}
-		channels = append(channels, ch)
-	}
-
-	return channels, rows.Err()
+	err := db.conn.Select(&channels, "SELECT * FROM channels ORDER BY type, name")
+	return channels, err
 }
 
 func (db *DB) CreateChannel(name string, channelType ChannelType, description string) error {
@@ -132,81 +133,34 @@ func (db *DB) DeleteChannel(name string) error {
 	return err
 }
 
-func (db *DB) CreateUsersTable() error {
-	query := `
-	CREATE TABLE IF NOT EXISTS users (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		username TEXT NOT NULL UNIQUE,
-		public_key TEXT NOT NULL,
-		is_admin INTEGER DEFAULT 0,
-		is_approved INTEGER DEFAULT 0,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		last_auth DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-	CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-	CREATE INDEX IF NOT EXISTS idx_users_public_key ON users(public_key);
-	`
-	_, err := db.conn.Exec(query)
-	return err
-}
-
 func (db *DB) GetUserByUsernameAndPublicKey(username, pubKey string) (*User, error) {
-	var user User
-	var isAdmin, isApproved int
-	err := db.conn.QueryRow(
-		"SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE username = ? AND public_key = ?",
-		username, pubKey,
-	).Scan(&user.ID, &user.Username, &user.PublicKey, &isAdmin, &isApproved, &user.CreatedAt, &user.LastAuth)
+	var raw rawUser
+	err := db.conn.Get(&raw, "SELECT * FROM users WHERE username = ? AND public_key = ?", username, pubKey)
 	if err != nil {
 		return nil, err
 	}
-	user.IsAdmin = isAdmin == 1
-	user.IsApproved = isApproved == 1
-	return &user, nil
+	return raw.toUser(), nil
 }
 
 func (db *DB) GetUserByPublicKey(pubKey string) (*User, error) {
-	var user User
-	var isAdmin, isApproved int
-	err := db.conn.QueryRow(
-		"SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE public_key = ?",
-		pubKey,
-	).Scan(&user.ID, &user.Username, &user.PublicKey, &isAdmin, &isApproved, &user.CreatedAt, &user.LastAuth)
+	var raw rawUser
+	err := db.conn.Get(&raw, "SELECT * FROM users WHERE public_key = ?", pubKey)
 	if err != nil {
 		return nil, err
 	}
-	user.IsAdmin = isAdmin == 1
-	user.IsApproved = isApproved == 1
-	return &user, nil
+	return raw.toUser(), nil
 }
 
 func (db *DB) GetUsersByUsername(username string) ([]User, error) {
-	rows, err := db.conn.Query(
-		"SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE username = ?",
-		username,
-	)
+	var rawUsers []rawUser
+	err := db.conn.Select(&rawUsers, "SELECT * FROM users WHERE username = ?", username)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	var users []User
-	for rows.Next() {
-		var user User
-		var isAdmin, isApproved int
-		if err := rows.Scan(&user.ID, &user.Username, &user.PublicKey, &isAdmin, &isApproved, &user.CreatedAt, &user.LastAuth); err != nil {
-			return nil, err
-		}
-		user.IsAdmin = isAdmin == 1
-		user.IsApproved = isApproved == 1
-		users = append(users, user)
-	}
-	return users, rows.Err()
+	return rawUsersToUsers(rawUsers), nil
 }
 
 func (db *DB) AddPublicKeyToUser(username, pubKey string) error {
-	// This is a no-op now since we allow multiple keys per user
-	// Just verify the user exists
 	var count int
 	err := db.conn.QueryRow("SELECT COUNT(*) FROM users WHERE username = ?", username).Scan(&count)
 	return err
@@ -217,7 +171,7 @@ func (db *DB) CreateUser(username, pubKey string, isAdmin bool) error {
 	approvedInt := 0
 	if isAdmin {
 		adminInt = 1
-		approvedInt = 1 // Admins are auto-approved
+		approvedInt = 1
 	}
 	_, err := db.conn.Exec(
 		"INSERT INTO users (username, public_key, is_admin, is_approved) VALUES (?, ?, ?, ?)",
@@ -253,26 +207,12 @@ func (db *DB) HasAnyUsers() (bool, error) {
 }
 
 func (db *DB) GetPendingUsers() ([]User, error) {
-	rows, err := db.conn.Query(
-		"SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users WHERE is_approved = 0 ORDER BY created_at",
-	)
+	var rawUsers []rawUser
+	err := db.conn.Select(&rawUsers, "SELECT * FROM users WHERE is_approved = 0 ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	var users []User
-	for rows.Next() {
-		var user User
-		var isAdmin, isApproved int
-		if err := rows.Scan(&user.ID, &user.Username, &user.PublicKey, &isAdmin, &isApproved, &user.CreatedAt, &user.LastAuth); err != nil {
-			return nil, err
-		}
-		user.IsAdmin = isAdmin == 1
-		user.IsApproved = isApproved == 1
-		users = append(users, user)
-	}
-	return users, rows.Err()
+	return rawUsersToUsers(rawUsers), nil
 }
 
 func (db *DB) ApproveUser(username string) error {
@@ -292,30 +232,16 @@ func (db *DB) ApproveUserByID(userID int) error {
 }
 
 func (db *DB) GetAllUsers() ([]User, error) {
-	rows, err := db.conn.Query(
-		"SELECT id, username, public_key, is_admin, is_approved, created_at, last_auth FROM users ORDER BY created_at",
-	)
+	var rawUsers []rawUser
+	err := db.conn.Select(&rawUsers, "SELECT * FROM users ORDER BY created_at")
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	var users []User
-	for rows.Next() {
-		var user User
-		var isAdmin, isApproved int
-		if err := rows.Scan(&user.ID, &user.Username, &user.PublicKey, &isAdmin, &isApproved, &user.CreatedAt, &user.LastAuth); err != nil {
-			return nil, err
-		}
-		user.IsAdmin = isAdmin == 1
-		user.IsApproved = isApproved == 1
-		users = append(users, user)
-	}
-	return users, rows.Err()
+	return rawUsersToUsers(rawUsers), nil
 }
 
 func (db *DB) runMigrations() error {
-	driver, err := sqlite.WithInstance(db.conn, &sqlite.Config{})
+	driver, err := sqlite.WithInstance(db.conn.DB, &sqlite.Config{})
 	if err != nil {
 		return err
 	}
