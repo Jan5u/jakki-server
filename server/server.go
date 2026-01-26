@@ -47,10 +47,22 @@ type UserAction struct {
 	Channel   string `json:"channel"`
 }
 
+type JoinScreenshareRequest struct {
+	EventType string `json:"type"`
+	User      string `json:"user"`
+}
+
 type voiceClient struct {
 	user   string
 	stream *quic.Stream
 	send   chan []byte
+}
+
+type screenshareClient struct {
+	user    string
+	stream  *quic.ReceiveStream
+	viewers map[string]*quic.SendStream
+	mu      sync.RWMutex
 }
 
 type Server struct {
@@ -59,9 +71,10 @@ type Server struct {
 	db       *database.DB
 
 	// Channel management
-	voiceChannels map[string]map[string]*voiceClient
-	textChannels  map[string]bool
-	eventStreams  []*quic.Stream
+	voiceChannels      map[string]map[string]*voiceClient
+	textChannels       map[string]bool
+	eventStreams       []*quic.Stream
+	screenshareStreams map[string]*screenshareClient
 
 	// Authentication
 	pendingChallenges  map[string][]byte
@@ -85,6 +98,7 @@ func NewServer(addr string, db *database.DB) *Server {
 		voiceChannels:      make(map[string]map[string]*voiceClient),
 		textChannels:       make(map[string]bool),
 		eventStreams:       make([]*quic.Stream, 0),
+		screenshareStreams: make(map[string]*screenshareClient),
 		pendingChallenges:  make(map[string][]byte),
 		authenticatedConns: make(map[string]string),
 		connPublicKeys:     make(map[string]string),
@@ -216,6 +230,24 @@ func (s *Server) handleConnection(conn *quic.Conn) {
 	}
 	go s.handleAuthStream(conn, authStream)
 
+	go func() {
+		for {
+			stream, err := conn.AcceptUniStream(context.Background())
+			if err != nil {
+				log.Printf("AcceptUniStream error: %v", err)
+				return
+			}
+			log.Printf("Accepted unidirectional stream id: %d", stream.StreamID())
+			switch stream.StreamID() {
+			case 2:
+				go s.handleScreenshareRecv(conn, stream)
+			default:
+				log.Printf("Unknown unidirectional stream id: %d", stream.StreamID())
+				stream.CancelRead(0)
+			}
+		}
+	}()
+
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
@@ -231,6 +263,66 @@ func (s *Server) handleConnection(conn *quic.Conn) {
 			log.Printf("Unknown stream id: %d", stream.StreamID())
 			if err := stream.Close(); err != nil {
 				log.Printf("Error closing unknown stream: %v", err)
+			}
+		}
+	}
+}
+
+func (s *Server) handleScreenshareRecv(conn *quic.Conn, stream *quic.ReceiveStream) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	username, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to open screenshare stream")
+		stream.CancelRead(0)
+		return
+	}
+
+	client := &screenshareClient{
+		user:    username,
+		stream:  stream,
+		viewers: make(map[string]*quic.SendStream),
+	}
+
+	s.mu.Lock()
+	s.screenshareStreams[username] = client
+	s.mu.Unlock()
+
+	log.Printf("User %s started screensharing", username)
+
+	defer func() {
+		s.mu.Lock()
+		for _, viewerStream := range client.viewers {
+			_ = (*viewerStream).Close()
+		}
+		delete(s.screenshareStreams, username)
+		s.mu.Unlock()
+		stream.CancelRead(0)
+		log.Printf("User %s stopped screensharing", username)
+	}()
+
+	buf := make([]byte, 8192)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil {
+			log.Printf("Read error from screenshare stream: %v", err)
+			return
+		}
+		log.Printf("Received %d bytes from screenshare stream (user: %s)", n, username)
+
+		client.mu.RLock()
+		viewers := make([]*quic.SendStream, 0, len(client.viewers))
+		for _, v := range client.viewers {
+			viewers = append(viewers, v)
+		}
+		client.mu.RUnlock()
+
+		for _, viewerStream := range viewers {
+			_ = (*viewerStream).SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+			if _, err := (*viewerStream).Write(buf[:n]); err != nil {
+				log.Printf("Error writing to viewer stream: %v", err)
 			}
 		}
 	}
@@ -502,6 +594,13 @@ func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 		var adminReq AdminRequest
 		if err := json.Unmarshal(buf[:n], &adminReq); err == nil && adminReq.Type == "admin_request" {
 			s.handleAdminRequest(conn, stream, &adminReq)
+			continue
+		}
+
+		// parse as joinScreenshare request
+		var joinReq JoinScreenshareRequest
+		if err := json.Unmarshal(buf[:n], &joinReq); err == nil && joinReq.EventType == "joinScreenshare" {
+			s.handleJoinScreenshare(conn, &joinReq)
 		}
 	}
 }
@@ -537,6 +636,51 @@ func (s *Server) handleAdminRequest(conn *quic.Conn, stream *quic.Stream, adminR
 	default:
 		s.sendAdminError(stream, adminReq.Request, "unknown admin request")
 	}
+}
+
+func (s *Server) handleJoinScreenshare(conn *quic.Conn, joinReq *JoinScreenshareRequest) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	viewerUsername, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to join screenshare")
+		return
+	}
+
+	targetUser := joinReq.User
+	log.Printf("User %s wants to join %s's screenshare", viewerUsername, targetUser)
+
+	s.mu.RLock()
+	screenshareClient, exists := s.screenshareStreams[targetUser]
+	s.mu.RUnlock()
+
+	if !exists {
+		log.Printf("User %s is not screensharing", targetUser)
+		return
+	}
+
+	sendStream, err := conn.OpenUniStreamSync(context.Background())
+	if err != nil {
+		log.Printf("Failed to open uni stream for viewer %s: %v", viewerUsername, err)
+		return
+	}
+
+	screenshareClient.mu.Lock()
+	screenshareClient.viewers[viewerUsername] = sendStream
+	screenshareClient.mu.Unlock()
+
+	log.Printf("User %s is now viewing %s's screenshare", viewerUsername, targetUser)
+
+	go func() {
+		<-conn.Context().Done()
+		screenshareClient.mu.Lock()
+		delete(screenshareClient.viewers, viewerUsername)
+		screenshareClient.mu.Unlock()
+		_ = sendStream.Close()
+		log.Printf("User %s stopped viewing %s's screenshare", viewerUsername, targetUser)
+	}()
 }
 
 func (s *Server) handleGetUsers(stream *quic.Stream, request string) {
