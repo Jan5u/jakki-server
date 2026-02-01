@@ -230,40 +230,53 @@ func (s *Server) handleConnection(conn *quic.Conn) {
 	}
 	go s.handleAuthStream(conn, authStream)
 
-	go func() {
-		for {
-			stream, err := conn.AcceptUniStream(context.Background())
-			if err != nil {
-				log.Printf("AcceptUniStream error: %v", err)
-				return
-			}
-			log.Printf("Accepted unidirectional stream id: %d", stream.StreamID())
-			switch stream.StreamID() {
-			case 2:
-				go s.handleScreenshareRecv(conn, stream)
-			default:
-				log.Printf("Unknown unidirectional stream id: %d", stream.StreamID())
-				stream.CancelRead(0)
-			}
-		}
-	}()
+	go s.acceptUniStreams(conn)
+	s.acceptBidiStreams(conn)
+}
 
+func (s *Server) acceptUniStreams(conn *quic.Conn) {
+	for {
+		stream, err := conn.AcceptUniStream(context.Background())
+		if err != nil {
+			log.Printf("AcceptUniStream error: %v", err)
+			return
+		}
+		log.Printf("Accepted unidirectional stream id: %d", stream.StreamID())
+		s.routeUniStream(conn, stream)
+	}
+}
+
+func (s *Server) routeUniStream(conn *quic.Conn, stream *quic.ReceiveStream) {
+	switch stream.StreamID() {
+	case 2:
+		go s.handleScreenshareRecv(conn, stream)
+	default:
+		log.Printf("Unknown unidirectional stream id: %d", stream.StreamID())
+		stream.CancelRead(0)
+	}
+}
+
+func (s *Server) acceptBidiStreams(conn *quic.Conn) {
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			log.Printf("AcceptStream error: %v", err)
 			return
 		}
-		switch stream.StreamID() {
-		case 0:
-			go s.handleEventStream(conn, stream)
-		case 4:
-			go s.handleVoiceStream(conn, stream)
-		default:
-			log.Printf("Unknown stream id: %d", stream.StreamID())
-			if err := stream.Close(); err != nil {
-				log.Printf("Error closing unknown stream: %v", err)
-			}
+		s.routeBidiStream(conn, stream)
+	}
+}
+
+func (s *Server) routeBidiStream(conn *quic.Conn, stream *quic.Stream) {
+	switch stream.StreamID() {
+	case 0:
+		go s.handleEventStream(conn, stream)
+	case 4:
+		go s.handleVoiceStream(conn, stream)
+	default:
+		log.Printf("Unknown stream id: %d", stream.StreamID())
+		if err := stream.Close(); err != nil {
+			log.Printf("Error closing unknown stream: %v", err)
 		}
 	}
 }
@@ -541,15 +554,8 @@ func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 		}
 	}()
 
-	// authenticate
 	connID := fmt.Sprintf("%p", conn)
-	s.mu.RLock()
-	_, authenticated := s.authenticatedConns[connID]
-	s.mu.RUnlock()
-
-	if !authenticated {
-		log.Printf("Unauthenticated connection attempted to access event stream")
-		_, _ = stream.Write([]byte("error:not authenticated"))
+	if !s.authenticateEventStream(connID, stream) {
 		return
 	}
 
@@ -557,11 +563,31 @@ func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 	s.eventStreams = append(s.eventStreams, stream)
 	s.mu.Unlock()
 
-	// Send server info with channels from database
+	if err := s.sendServerInfo(stream); err != nil {
+		return
+	}
+
+	s.processEventMessages(conn, stream)
+}
+
+func (s *Server) authenticateEventStream(connID string, stream *quic.Stream) bool {
+	s.mu.RLock()
+	_, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to access event stream")
+		_, _ = stream.Write([]byte("error:not authenticated"))
+		return false
+	}
+	return true
+}
+
+func (s *Server) sendServerInfo(stream *quic.Stream) error {
 	channelNames, err := s.db.GetAllChannelNames()
 	if err != nil {
 		log.Printf("Error getting channel names: %v", err)
-		return
+		return err
 	}
 
 	data := &ServerInfo{
@@ -571,14 +597,17 @@ func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 	encjson, err := json.Marshal(data)
 	if err != nil {
 		log.Println(err)
+		return err
 	}
 	encjson = append(encjson, '\n')
 	if _, err := stream.Write(encjson); err != nil {
 		log.Printf("Error writing server info: %v", err)
-		return
+		return err
 	}
+	return nil
+}
 
-	// handle incoming messages
+func (s *Server) processEventMessages(conn *quic.Conn, stream *quic.Stream) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := stream.Read(buf)
@@ -590,18 +619,20 @@ func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 		message := string(buf[:n])
 		log.Printf("Read %d bytes from EVENT stream: %s", n, message)
 
-		// parse as admin request
-		var adminReq AdminRequest
-		if err := json.Unmarshal(buf[:n], &adminReq); err == nil && adminReq.Type == "admin_request" {
-			s.handleAdminRequest(conn, stream, &adminReq)
-			continue
-		}
+		s.routeEventMessage(conn, stream, buf[:n])
+	}
+}
 
-		// parse as joinScreenshare request
-		var joinReq JoinScreenshareRequest
-		if err := json.Unmarshal(buf[:n], &joinReq); err == nil && joinReq.EventType == "joinScreenshare" {
-			s.handleJoinScreenshare(conn, &joinReq)
-		}
+func (s *Server) routeEventMessage(conn *quic.Conn, stream *quic.Stream, data []byte) {
+	var adminReq AdminRequest
+	if err := json.Unmarshal(data, &adminReq); err == nil && adminReq.Type == "admin_request" {
+		s.handleAdminRequest(conn, stream, &adminReq)
+		return
+	}
+
+	var joinReq JoinScreenshareRequest
+	if err := json.Unmarshal(data, &joinReq); err == nil && joinReq.EventType == "joinScreenshare" {
+		s.handleJoinScreenshare(conn, &joinReq)
 	}
 }
 
