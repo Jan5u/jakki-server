@@ -6,12 +6,16 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"math/big"
 	"os"
-	"strconv"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,10 +28,28 @@ type ServerInfo struct {
 	Channels  []string `json:"channels"`
 }
 
+type AdminRequest struct {
+	Request string `json:"request"`
+	Type    string `json:"type"`
+	UserID  int    `json:"user_id,omitempty"`
+}
+
+type AdminResponse struct {
+	EventType string      `json:"type"`
+	Request   string      `json:"request"`
+	Data      interface{} `json:"data"`
+	Error     string      `json:"error,omitempty"`
+}
+
 type UserAction struct {
 	EventType string `json:"type"`
 	User      string `json:"user"`
 	Channel   string `json:"channel"`
+}
+
+type JoinScreenshareRequest struct {
+	EventType string `json:"type"`
+	User      string `json:"user"`
 }
 
 type voiceClient struct {
@@ -36,27 +58,51 @@ type voiceClient struct {
 	send   chan []byte
 }
 
+type screenshareClient struct {
+	user    string
+	stream  *quic.ReceiveStream
+	viewers map[string]*quic.SendStream
+	mu      sync.RWMutex
+}
+
 type Server struct {
 	addr     string
 	listener *quic.Listener
 	db       *database.DB
 
 	// Channel management
-	voiceChannels    map[string]map[string]*voiceClient
-	textChannels     map[string]bool
-	channelUserCount map[string]int
-	eventStreams     []*quic.Stream
-	mu               sync.RWMutex
+	voiceChannels      map[string]map[string]*voiceClient
+	textChannels       map[string]bool
+	eventStreams       []*quic.Stream
+	screenshareStreams map[string]*screenshareClient
+
+	// Authentication
+	pendingChallenges  map[string][]byte
+	authenticatedConns map[string]string
+	connPublicKeys     map[string]string
+	hasInitialAdmin    bool
+
+	mu sync.RWMutex
 }
 
 func NewServer(addr string, db *database.DB) *Server {
+	hasUsers, err := db.HasAnyUsers()
+	if err != nil {
+		log.Printf("Warning: Failed to check if users exist: %v", err)
+		hasUsers = true
+	}
+
 	return &Server{
-		addr:             addr,
-		db:               db,
-		voiceChannels:    make(map[string]map[string]*voiceClient),
-		textChannels:     make(map[string]bool),
-		channelUserCount: make(map[string]int),
-		eventStreams:     make([]*quic.Stream, 0),
+		addr:               addr,
+		db:                 db,
+		voiceChannels:      make(map[string]map[string]*voiceClient),
+		textChannels:       make(map[string]bool),
+		eventStreams:       make([]*quic.Stream, 0),
+		screenshareStreams: make(map[string]*screenshareClient),
+		pendingChallenges:  make(map[string][]byte),
+		authenticatedConns: make(map[string]string),
+		connPublicKeys:     make(map[string]string),
+		hasInitialAdmin:    hasUsers,
 	}
 }
 
@@ -171,41 +217,377 @@ func (s *Server) acceptStreamLoop(listener *quic.Listener) {
 }
 
 func (s *Server) handleConnection(conn *quic.Conn) {
+	connID := fmt.Sprintf("%p", conn)
+
+	defer func() {
+		s.cleanupConnection(connID)
+	}()
+
+	authStream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		log.Printf("Failed to open auth stream: %v", err)
+		return
+	}
+	go s.handleAuthStream(conn, authStream)
+
+	go s.acceptUniStreams(conn)
+	s.acceptBidiStreams(conn)
+}
+
+func (s *Server) acceptUniStreams(conn *quic.Conn) {
+	for {
+		stream, err := conn.AcceptUniStream(context.Background())
+		if err != nil {
+			log.Printf("AcceptUniStream error: %v", err)
+			return
+		}
+		log.Printf("Accepted unidirectional stream id: %d", stream.StreamID())
+		s.routeUniStream(conn, stream)
+	}
+}
+
+func (s *Server) routeUniStream(conn *quic.Conn, stream *quic.ReceiveStream) {
+	switch stream.StreamID() {
+	case 2:
+		go s.handleScreenshareRecv(conn, stream)
+	default:
+		log.Printf("Unknown unidirectional stream id: %d", stream.StreamID())
+		stream.CancelRead(0)
+	}
+}
+
+func (s *Server) acceptBidiStreams(conn *quic.Conn) {
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
 			log.Printf("AcceptStream error: %v", err)
 			return
 		}
-		switch stream.StreamID() {
-		case 0:
-			go s.handleEventStream(stream)
-		case 4:
-			go s.handleVoiceStream(stream)
-		default:
-			log.Printf("Unknown stream id: %d", stream.StreamID())
-			if err := stream.Close(); err != nil {
-				log.Printf("Error closing unknown stream: %v", err)
+		s.routeBidiStream(conn, stream)
+	}
+}
+
+func (s *Server) routeBidiStream(conn *quic.Conn, stream *quic.Stream) {
+	switch stream.StreamID() {
+	case 0:
+		go s.handleEventStream(conn, stream)
+	case 4:
+		go s.handleVoiceStream(conn, stream)
+	default:
+		log.Printf("Unknown stream id: %d", stream.StreamID())
+		if err := stream.Close(); err != nil {
+			log.Printf("Error closing unknown stream: %v", err)
+		}
+	}
+}
+
+func (s *Server) handleScreenshareRecv(conn *quic.Conn, stream *quic.ReceiveStream) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	username, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to open screenshare stream")
+		stream.CancelRead(0)
+		return
+	}
+
+	client := &screenshareClient{
+		user:    username,
+		stream:  stream,
+		viewers: make(map[string]*quic.SendStream),
+	}
+
+	s.mu.Lock()
+	s.screenshareStreams[username] = client
+	s.mu.Unlock()
+
+	log.Printf("User %s started screensharing", username)
+
+	defer func() {
+		s.mu.Lock()
+		for _, viewerStream := range client.viewers {
+			_ = (*viewerStream).Close()
+		}
+		delete(s.screenshareStreams, username)
+		s.mu.Unlock()
+		stream.CancelRead(0)
+		log.Printf("User %s stopped screensharing", username)
+	}()
+
+	buf := make([]byte, 8192)
+	for {
+		n, err := stream.Read(buf)
+		if err != nil {
+			log.Printf("Read error from screenshare stream: %v", err)
+			return
+		}
+		log.Printf("Received %d bytes from screenshare stream (user: %s)", n, username)
+
+		client.mu.RLock()
+		viewers := make([]*quic.SendStream, 0, len(client.viewers))
+		for _, v := range client.viewers {
+			viewers = append(viewers, v)
+		}
+		client.mu.RUnlock()
+
+		for _, viewerStream := range viewers {
+			_ = (*viewerStream).SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+			if _, err := (*viewerStream).Write(buf[:n]); err != nil {
+				log.Printf("Error writing to viewer stream: %v", err)
 			}
 		}
 	}
 }
 
-func (s *Server) handleEventStream(stream *quic.Stream) {
+func (s *Server) handleAuthStream(conn *quic.Conn, stream *quic.Stream) {
+	defer func() {
+		if err := stream.Close(); err != nil {
+			log.Printf("Error closing auth stream: %v", err)
+		}
+	}()
+
+	connID := fmt.Sprintf("%p", conn)
+	challenge, err := s.sendAuthChallenge(connID, stream)
+	if err != nil {
+		return
+	}
+
+	username, pubKeyHex, err := s.readAndVerifyAuthResponse(connID, stream, challenge)
+	if err != nil {
+		return
+	}
+
+	if err := s.authenticateOrCreateUser(connID, stream, username, pubKeyHex); err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	s.authenticatedConns[connID] = username
+	s.connPublicKeys[connID] = pubKeyHex
+	delete(s.pendingChallenges, connID)
+	s.mu.Unlock()
+
+	log.Printf("User authenticated: %s (pubkey: %s...)", username, pubKeyHex[:16])
+
+	if _, err := stream.Write([]byte("ok")); err != nil {
+		log.Printf("Failed to send ok response: %v", err)
+	}
+}
+
+func (s *Server) sendAuthChallenge(connID string, stream *quic.Stream) ([]byte, error) {
+	challenge := make([]byte, 32)
+	if _, err := rand.Read(challenge); err != nil {
+		log.Printf("Failed to generate challenge: %v", err)
+		_, _ = stream.Write([]byte("error:internal server error"))
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.pendingChallenges[connID] = challenge
+	s.mu.Unlock()
+
+	challengeHex := hex.EncodeToString(challenge)
+	if _, err := stream.Write([]byte(challengeHex)); err != nil {
+		log.Printf("Failed to send challenge: %v", err)
+		return nil, err
+	}
+
+	return challenge, nil
+}
+
+func (s *Server) readAndVerifyAuthResponse(connID string, stream *quic.Stream, challenge []byte) (string, string, error) {
+	buf := make([]byte, 8192)
+	n, err := stream.Read(buf)
+	if err != nil {
+		log.Printf("Failed to read auth response: %v", err)
+		s.cleanupChallenge(connID)
+		return "", "", err
+	}
+
+	username, pubKeyHex, signatureHex, err := s.parseAuthResponse(string(buf[:n]))
+	if err != nil {
+		_, _ = stream.Write([]byte("error:" + err.Error()))
+		s.cleanupChallenge(connID)
+		return "", "", err
+	}
+
+	if err := s.verifySignature(pubKeyHex, signatureHex, challenge); err != nil {
+		_, _ = stream.Write([]byte("error:" + err.Error()))
+		s.cleanupChallenge(connID)
+		return "", "", err
+	}
+
+	return username, pubKeyHex, nil
+}
+
+func (s *Server) parseAuthResponse(response string) (string, string, string, error) {
+	parts := strings.SplitN(response, ":", 3)
+	if len(parts) != 3 {
+		log.Printf("Invalid auth response format: got %d parts, expected 3", len(parts))
+		return "", "", "", errors.New("invalid format")
+	}
+
+	username := parts[0]
+	if err := validateUsername(username); err != nil {
+		log.Printf("Invalid username: %v", err)
+		return "", "", "", err
+	}
+
+	return username, parts[1], parts[2], nil
+}
+
+func (s *Server) verifySignature(pubKeyHex, signatureHex string, challenge []byte) error {
+	pubKey, err := hex.DecodeString(pubKeyHex)
+	if err != nil || len(pubKey) != ed25519.PublicKeySize {
+		log.Printf("Invalid public key: %v", err)
+		return errors.New("invalid public key")
+	}
+
+	signature, err := hex.DecodeString(signatureHex)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		log.Printf("Invalid signature: %v", err)
+		return errors.New("invalid signature")
+	}
+
+	if !ed25519.Verify(ed25519.PublicKey(pubKey), challenge, signature) {
+		log.Printf("Signature verification failed")
+		return errors.New("authentication failed")
+	}
+
+	return nil
+}
+
+func (s *Server) authenticateOrCreateUser(connID string, stream *quic.Stream, username, pubKeyHex string) error {
+	existingUser, userErr := s.db.GetUserByUsernameAndPublicKey(username, pubKeyHex)
+	if userErr == nil {
+		return s.handleExistingUser(connID, stream, existingUser, pubKeyHex)
+	}
+	return s.handleNewUser(connID, stream, username, pubKeyHex)
+}
+
+func (s *Server) handleExistingUser(connID string, stream *quic.Stream, user *database.User, pubKeyHex string) error {
+	if !user.IsApproved {
+		log.Printf("User %s not yet approved by admin", user.Username)
+		_, _ = stream.Write([]byte("error:pending approval"))
+		s.cleanupChallenge(connID)
+		return errors.New("pending approval")
+	}
+	if err := s.db.UpdateLastAuth(pubKeyHex); err != nil {
+		log.Printf("Failed to update last auth: %v", err)
+	}
+	return nil
+}
+
+func (s *Server) handleNewUser(connID string, stream *quic.Stream, username, pubKeyHex string) error {
+	isAvailable, err := s.db.IsUsernameAvailable(username)
+	if err != nil {
+		log.Printf("Failed to check username availability: %v", err)
+		_, _ = stream.Write([]byte("error:internal server error"))
+		s.cleanupChallenge(connID)
+		return err
+	}
+
+	if !isAvailable {
+		log.Printf("Username already taken: %s", username)
+		_, _ = stream.Write([]byte("error:username already taken"))
+		s.cleanupChallenge(connID)
+		return errors.New("username already taken")
+	}
+
+	isAdmin := s.checkAndSetFirstAdmin(username)
+
+	if err := s.db.CreateUser(username, pubKeyHex, isAdmin); err != nil {
+		log.Printf("Failed to create user: %v", err)
+		_, _ = stream.Write([]byte("error:failed to create user"))
+		s.cleanupChallenge(connID)
+		return err
+	}
+
+	if !isAdmin {
+		log.Printf("New user %s created, pending admin approval", username)
+		_, _ = stream.Write([]byte("error:pending approval"))
+		s.cleanupChallenge(connID)
+		return errors.New("pending approval")
+	}
+
+	return nil
+}
+
+func (s *Server) checkAndSetFirstAdmin(username string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	isAdmin := !s.hasInitialAdmin
+	if isAdmin {
+		s.hasInitialAdmin = true
+		log.Printf("Creating first user as admin: %s", username)
+	}
+	return isAdmin
+}
+
+func (s *Server) cleanupChallenge(connID string) {
+	s.mu.Lock()
+	delete(s.pendingChallenges, connID)
+	s.mu.Unlock()
+}
+
+func validateUsername(username string) error {
+	if len(username) < 3 || len(username) > 20 {
+		return errors.New("username must be 3-20 characters")
+	}
+	matched, _ := regexp.MatchString("^[a-zA-Z0-9_-]+$", username)
+	if !matched {
+		return errors.New("username can only contain letters, numbers, underscore, and hyphen")
+	}
+	if strings.Contains(username, ":") {
+		return errors.New("username cannot contain colon")
+	}
+
+	return nil
+}
+
+func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 	defer func() {
 		if err := stream.Close(); err != nil {
 			log.Printf("Error closing event stream: %v", err)
 		}
 	}()
+
+	connID := fmt.Sprintf("%p", conn)
+	if !s.authenticateEventStream(connID, stream) {
+		return
+	}
+
 	s.mu.Lock()
 	s.eventStreams = append(s.eventStreams, stream)
 	s.mu.Unlock()
 
-	// Send server info with channels from database
+	if err := s.sendServerInfo(stream); err != nil {
+		return
+	}
+
+	s.processEventMessages(conn, stream)
+}
+
+func (s *Server) authenticateEventStream(connID string, stream *quic.Stream) bool {
+	s.mu.RLock()
+	_, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to access event stream")
+		_, _ = stream.Write([]byte("error:not authenticated"))
+		return false
+	}
+	return true
+}
+
+func (s *Server) sendServerInfo(stream *quic.Stream) error {
 	channelNames, err := s.db.GetAllChannelNames()
 	if err != nil {
 		log.Printf("Error getting channel names: %v", err)
-		return
+		return err
 	}
 
 	data := &ServerInfo{
@@ -215,14 +597,17 @@ func (s *Server) handleEventStream(stream *quic.Stream) {
 	encjson, err := json.Marshal(data)
 	if err != nil {
 		log.Println(err)
+		return err
 	}
 	encjson = append(encjson, '\n')
 	if _, err := stream.Write(encjson); err != nil {
 		log.Printf("Error writing server info: %v", err)
-		return
+		return err
 	}
+	return nil
+}
 
-	// handle incoming messages
+func (s *Server) processEventMessages(conn *quic.Conn, stream *quic.Stream) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := stream.Read(buf)
@@ -231,28 +616,219 @@ func (s *Server) handleEventStream(stream *quic.Stream) {
 			return
 		}
 
-		// only used for heartbeat for now
-		log.Printf("Read %d bytes from EVENT stream", n)
+		message := string(buf[:n])
+		log.Printf("Read %d bytes from EVENT stream: %s", n, message)
+
+		s.routeEventMessage(conn, stream, buf[:n])
 	}
 }
 
-func (s *Server) handleVoiceStream(stream *quic.Stream) {
-	buf := make([]byte, 8192)
+func (s *Server) routeEventMessage(conn *quic.Conn, stream *quic.Stream, data []byte) {
+	var adminReq AdminRequest
+	if err := json.Unmarshal(data, &adminReq); err == nil && adminReq.Type == "admin_request" {
+		s.handleAdminRequest(conn, stream, &adminReq)
+		return
+	}
 
-	// when voice stream is created read from stream which channel to join
+	var joinReq JoinScreenshareRequest
+	if err := json.Unmarshal(data, &joinReq); err == nil && joinReq.EventType == "joinScreenshare" {
+		s.handleJoinScreenshare(conn, &joinReq)
+	}
+}
+
+func (s *Server) handleAdminRequest(conn *quic.Conn, stream *quic.Stream, adminReq *AdminRequest) {
+	// check if user is admin
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	username, authenticated := s.authenticatedConns[connID]
+	pubKey, hasKey := s.connPublicKeys[connID]
+	s.mu.RUnlock()
+
+	if !authenticated || !hasKey {
+		s.sendAdminError(stream, adminReq.Request, "not authenticated")
+		return
+	}
+	user, err := s.db.GetUserByUsernameAndPublicKey(username, pubKey)
+	if err != nil {
+		s.sendAdminError(stream, adminReq.Request, "user not found")
+		return
+	}
+	if !user.IsAdmin {
+		s.sendAdminError(stream, adminReq.Request, "admin privileges required")
+		return
+	}
+
+	// handle admin requests
+	switch adminReq.Request {
+	case "get_users":
+		s.handleGetUsers(stream, adminReq.Request)
+	case "approve_user":
+		s.handleApproveUser(stream, adminReq)
+	default:
+		s.sendAdminError(stream, adminReq.Request, "unknown admin request")
+	}
+}
+
+func (s *Server) handleJoinScreenshare(conn *quic.Conn, joinReq *JoinScreenshareRequest) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	viewerUsername, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to join screenshare")
+		return
+	}
+
+	targetUser := joinReq.User
+	log.Printf("User %s wants to join %s's screenshare", viewerUsername, targetUser)
+
+	s.mu.RLock()
+	screenshareClient, exists := s.screenshareStreams[targetUser]
+	s.mu.RUnlock()
+
+	if !exists {
+		log.Printf("User %s is not screensharing", targetUser)
+		return
+	}
+
+	sendStream, err := conn.OpenUniStreamSync(context.Background())
+	if err != nil {
+		log.Printf("Failed to open uni stream for viewer %s: %v", viewerUsername, err)
+		return
+	}
+
+	screenshareClient.mu.Lock()
+	screenshareClient.viewers[viewerUsername] = sendStream
+	screenshareClient.mu.Unlock()
+
+	log.Printf("User %s is now viewing %s's screenshare", viewerUsername, targetUser)
+
+	go func() {
+		<-conn.Context().Done()
+		screenshareClient.mu.Lock()
+		delete(screenshareClient.viewers, viewerUsername)
+		screenshareClient.mu.Unlock()
+		_ = sendStream.Close()
+		log.Printf("User %s stopped viewing %s's screenshare", viewerUsername, targetUser)
+	}()
+}
+
+func (s *Server) handleGetUsers(stream *quic.Stream, request string) {
+	users, err := s.db.GetAllUsers()
+	if err != nil {
+		s.sendAdminError(stream, request, "failed to retrieve users")
+		return
+	}
+
+	response := AdminResponse{
+		EventType: "admin_response",
+		Request:   request,
+		Data:      users,
+	}
+
+	s.sendAdminResponse(stream, &response)
+}
+
+func (s *Server) handleApproveUser(stream *quic.Stream, adminReq *AdminRequest) {
+	if adminReq.UserID <= 0 {
+		s.sendAdminError(stream, adminReq.Request, "invalid user_id")
+		return
+	}
+
+	err := s.db.ApproveUserByID(adminReq.UserID)
+	if err != nil {
+		log.Printf("Failed to approve user ID %d: %v", adminReq.UserID, err)
+		s.sendAdminError(stream, adminReq.Request, "failed to approve user")
+		return
+	}
+
+	response := AdminResponse{
+		EventType: "admin_response",
+		Request:   adminReq.Request,
+		Data:      map[string]interface{}{"user_id": adminReq.UserID, "status": "approved"},
+	}
+
+	s.sendAdminResponse(stream, &response)
+}
+
+func (s *Server) sendAdminError(stream *quic.Stream, request, errorMsg string) {
+	response := AdminResponse{
+		EventType: "admin_response",
+		Request:   request,
+		Error:     errorMsg,
+	}
+	s.sendAdminResponse(stream, &response)
+}
+
+func (s *Server) sendAdminResponse(stream *quic.Stream, response *AdminResponse) {
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Error marshaling admin response: %v", err)
+		return
+	}
+
+	jsonData = append(jsonData, '\n')
+
+	if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("Error setting write deadline: %v", err)
+		return
+	}
+
+	if _, err := stream.Write(jsonData); err != nil {
+		log.Printf("Error writing admin response: %v", err)
+	}
+
+	_ = stream.SetWriteDeadline(time.Time{})
+}
+
+func (s *Server) handleVoiceStream(conn *quic.Conn, stream *quic.Stream) {
+	connID := fmt.Sprintf("%p", conn)
+	username, err := s.authenticateVoiceStream(connID, stream)
+	if err != nil {
+		return
+	}
+
+	channel, err := s.readChannelName(stream)
+	if err != nil {
+		return
+	}
+
+	if err := s.joinVoiceChannel(channel, username, stream); err != nil {
+		return
+	}
+
+	s.handleVoicePackets(stream, channel, username)
+}
+
+func (s *Server) authenticateVoiceStream(connID string, stream *quic.Stream) (string, error) {
+	s.mu.RLock()
+	username, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to access voice stream")
+		_, _ = stream.Write([]byte("error:not authenticated"))
+		_ = stream.Close()
+		return "", errors.New("not authenticated")
+	}
+	return username, nil
+}
+
+func (s *Server) readChannelName(stream *quic.Stream) (string, error) {
+	buf := make([]byte, 8192)
 	n, err := stream.Read(buf)
 	if err != nil {
 		log.Printf("Read error: %v", err)
-		return
+		return "", err
 	}
 	log.Printf("Read %d bytes from voice stream", n)
+	channel := string(buf[:n])
+	log.Printf("Received from voice stream: %s", channel)
+	return channel, nil
+}
 
-	msg := string(buf[:n])
-	log.Printf("Received from voice stream: %s", msg)
-
-	channel := msg
-
-	// check if channel exists
+func (s *Server) joinVoiceChannel(channel, username string, stream *quic.Stream) error {
 	s.mu.RLock()
 	_, exists := s.voiceChannels[channel]
 	s.mu.RUnlock()
@@ -261,19 +837,17 @@ func (s *Server) handleVoiceStream(stream *quic.Stream) {
 		log.Printf("Voice channel not found: %s", channel)
 		_, _ = stream.Write([]byte("error:channel not found"))
 		_ = stream.Close()
-		return
+		return errors.New("channel not found")
 	}
-
-	s.channelUserCount[channel]++
-	username := "user" + strconv.Itoa(s.channelUserCount[channel])
 
 	s.addStreamToChannel(channel, username, stream)
 	log.Printf("User %s joined %s", username, channel)
-
-	// send ok for voice packets
 	s.sendOkMessage(stream)
+	return nil
+}
 
-	// wait for voice packets
+func (s *Server) handleVoicePackets(stream *quic.Stream, channel, username string) {
+	buf := make([]byte, 8192)
 	for {
 		n, err := stream.Read(buf)
 		if err != nil {
@@ -282,19 +856,19 @@ func (s *Server) handleVoiceStream(stream *quic.Stream) {
 		}
 		log.Printf("Read %d bytes from voice stream", n)
 
-		// combine username with payload using a delimiter
-		usernameBytes := []byte(username)
-		delimiter := []byte(":")
-
-		// create combined message: [username][delimiter][payload]
-		combined := make([]byte, len(usernameBytes)+len(delimiter)+n)
-		copy(combined, usernameBytes)
-		copy(combined[len(usernameBytes):], delimiter)
-		copy(combined[len(usernameBytes)+len(delimiter):], buf[:n])
-
-		// broadcast to other users in the same channel
+		combined := s.createVoicePacket(username, buf[:n])
 		s.broadcastVoiceToChannel(channel, username, combined)
 	}
+}
+
+func (s *Server) createVoicePacket(username string, payload []byte) []byte {
+	usernameBytes := []byte(username)
+	delimiter := []byte(":")
+	combined := make([]byte, len(usernameBytes)+len(delimiter)+len(payload))
+	copy(combined, usernameBytes)
+	copy(combined[len(usernameBytes):], delimiter)
+	copy(combined[len(usernameBytes)+len(delimiter):], payload)
+	return combined
 }
 
 func (s *Server) sendOkMessage(stream *quic.Stream) {
@@ -344,7 +918,7 @@ func (s *Server) addStreamToChannel(channel, user string, stream *quic.Stream) *
 	vc := &voiceClient{
 		user:   user,
 		stream: stream,
-		send:   make(chan []byte, 32), // small buffer; tune as needed
+		send:   make(chan []byte, 32),
 	}
 
 	s.mu.Lock()
@@ -360,12 +934,11 @@ func (s *Server) addStreamToChannel(channel, user string, stream *quic.Stream) *
 	go s.voiceWriterLoop(channel, vc)
 
 	// send event that user has joined this channel
-	joinEvent := UserAction{
+	go s.broadcastEvent(UserAction{
 		EventType: "UserJoin",
 		User:      user,
 		Channel:   channel,
-	}
-	s.broadcastEvent(joinEvent)
+	})
 	return vc
 }
 
@@ -393,8 +966,40 @@ func (s *Server) removeVoiceClient(channel, user string) {
 			close(vc.send)
 			log.Printf("Removed voice client user=%s from channel=%s", user, channel)
 		}
-		if len(channelStreams) == 0 {
-			delete(s.voiceChannels, channel)
+	}
+}
+
+func (s *Server) cleanupConnection(connID string) {
+	s.mu.Lock()
+	username, wasAuthenticated := s.authenticatedConns[connID]
+	delete(s.authenticatedConns, connID)
+	delete(s.connPublicKeys, connID)
+	delete(s.pendingChallenges, connID)
+	s.mu.Unlock()
+
+	if wasAuthenticated {
+		log.Printf("Connection closed for user: %s", username)
+		// Remove user from all voice channels
+		s.removeUserFromAllChannels(username)
+	}
+}
+
+func (s *Server) removeUserFromAllChannels(username string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for channelName, channelStreams := range s.voiceChannels {
+		if vc, exists := channelStreams[username]; exists {
+			delete(channelStreams, username)
+			_ = vc.stream.Close()
+			close(vc.send)
+			log.Printf("Removed user %s from channel %s on disconnect", username, channelName)
+
+			go s.broadcastEvent(UserAction{
+				EventType: "UserLeave",
+				User:      username,
+				Channel:   channelName,
+			})
 		}
 	}
 }
