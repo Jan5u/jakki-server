@@ -1,0 +1,11 @@
+.dockerignore
+.git
+.github
+.gitignore
+.golangci.yaml
+Dockerfile
+Makefile
+README.md
+bin/
+compose.yaml
+jakkiserver_data/

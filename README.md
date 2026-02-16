@@ -2,14 +2,27 @@
 
 ## Getting started
 
-### Running on local
+### Run Docker Hub image with Docker Compose
+```yaml
+services:
+  jakkiserver:
+    image: jan5u/jakki
+    container_name: jakki
+    restart: unless-stopped
+    ports:
+      - "7777:7777/udp"
+    volumes:
+      - ./jakkiserver_data:/jakkiserver_data
+```
+
+### Build on local
 ```bash
 make tidy
 make build
 make bin
 ```
 
-### Running with Docker Compose
+### Build with Docker Compose
 ```bash
 docker compose up -d
 ```

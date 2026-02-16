@@ -32,13 +32,10 @@ jobs:
     - name: Test
       run: go test -race -v ./...
 
-  build:
+  docker-build:
     needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
-    - uses: actions/setup-go@v6
-      with:
-        go-version-file: ./go.mod
-    - name: Build
-      run: go build -v ./...
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag jan5u/jakki:latest

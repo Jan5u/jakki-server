@@ -11,5 +11,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o bin/jakkiserver cmd/ja
 FROM scratch
 WORKDIR /app
 COPY --from=build /build/bin/jakkiserver bin/jakkiserver
+COPY LICENSE /LICENSE
 EXPOSE 7777/udp
 ENTRYPOINT ["bin/jakkiserver"]
