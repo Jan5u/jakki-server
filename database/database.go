@@ -70,6 +70,35 @@ func rawUsersToUsers(rawUsers []rawUser) []User {
 	return users
 }
 
+type Message struct {
+	ID         int    `db:"id"         json:"id"`
+	Channel    string `db:"channel"    json:"channel"`
+	User       string `db:"user"       json:"user"`
+	Content    string `db:"content"    json:"content"`
+	Compressed bool   `db:"compressed" json:"compressed"`
+	CreatedAt  string `db:"created_at" json:"created_at"`
+}
+
+type rawMessage struct {
+	ID         int    `db:"id"`
+	Channel    string `db:"channel"`
+	User       string `db:"user"`
+	Content    string `db:"content"`
+	Compressed int    `db:"compressed"`
+	CreatedAt  string `db:"created_at"`
+}
+
+func (r *rawMessage) toMessage() Message {
+	return Message{
+		ID:         r.ID,
+		Channel:    r.Channel,
+		User:       r.User,
+		Content:    r.Content,
+		Compressed: r.Compressed == 1,
+		CreatedAt:  r.CreatedAt,
+	}
+}
+
 type DB struct {
 	conn *sqlx.DB
 }
@@ -238,6 +267,59 @@ func (db *DB) GetAllUsers() ([]User, error) {
 		return nil, err
 	}
 	return rawUsersToUsers(rawUsers), nil
+}
+
+func (db *DB) SaveMessage(channel, user, content string, compressed bool) (*Message, error) {
+	compressedInt := 0
+	if compressed {
+		compressedInt = 1
+	}
+	result, err := db.conn.Exec(
+		"INSERT INTO messages (channel, user, content, compressed) VALUES (?, ?, ?, ?)",
+		channel, user, content, compressedInt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	var raw rawMessage
+	err = db.conn.Get(&raw, "SELECT id, channel, user, content, compressed, created_at FROM messages WHERE id = ?", id)
+	if err != nil {
+		return nil, err
+	}
+	msg := raw.toMessage()
+	return &msg, nil
+}
+
+func (db *DB) GetMessages(channel string, limit, before int) ([]Message, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	var rawMessages []rawMessage
+	var err error
+
+	if before > 0 {
+		err = db.conn.Select(&rawMessages,
+			"SELECT id, channel, user, content, compressed, created_at FROM messages WHERE channel = ? AND id < ? ORDER BY id DESC LIMIT ?",
+			channel, before, limit)
+	} else {
+		err = db.conn.Select(&rawMessages,
+			"SELECT id, channel, user, content, compressed, created_at FROM messages WHERE channel = ? ORDER BY id DESC LIMIT ?",
+			channel, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	messages := make([]Message, len(rawMessages))
+	for i, rm := range rawMessages {
+		messages[len(rawMessages)-1-i] = rm.toMessage()
+	}
+	return messages, nil
 }
 
 func (db *DB) runMigrations() error {
