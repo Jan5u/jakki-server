@@ -24,6 +24,18 @@ CREATE INDEX IF NOT EXISTS idx_users_public_key ON users(public_key);
 CREATE INDEX IF NOT EXISTS idx_channels_type ON channels(type);
 CREATE INDEX IF NOT EXISTS idx_channels_name ON channels(name);
 
+-- Create messages table
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,
+    user TEXT NOT NULL,
+    content TEXT NOT NULL,
+    compressed INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_channel_created ON messages(channel, created_at);
+
 -- Insert default channels
 INSERT OR IGNORE INTO channels (name, type, description) VALUES 
     ('#general', 'text', 'General text channel'),

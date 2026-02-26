@@ -6,14 +6,19 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"log/slog"
+	"math"
 	"math/big"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -35,10 +40,10 @@ type AdminRequest struct {
 }
 
 type AdminResponse struct {
-	EventType string      `json:"type"`
-	Request   string      `json:"request"`
-	Data      interface{} `json:"data"`
-	Error     string      `json:"error,omitempty"`
+	EventType string `json:"type"`
+	Request   string `json:"request"`
+	Data      any    `json:"data"`
+	Error     string `json:"error,omitempty"`
 }
 
 type UserAction struct {
@@ -47,9 +52,56 @@ type UserAction struct {
 	Channel   string `json:"channel"`
 }
 
+type IncomingMessage struct {
+	EventType  string `json:"type"`
+	Channel    string `json:"channel"`
+	Content    string `json:"content"`
+	Compressed bool   `json:"compressed"`
+}
+
+type OutgoingMessage struct {
+	EventType  string `json:"type"`
+	Channel    string `json:"channel"`
+	Content    string `json:"content"`
+	Compressed bool   `json:"compressed"`
+	User       string `json:"user"`
+	Timestamp  string `json:"timestamp"`
+	ID         int    `json:"id"`
+}
+
+type MessageHistoryRequest struct {
+	EventType string `json:"type"`
+	Request   string `json:"request"`
+	Channel   string `json:"channel"`
+	Limit     int    `json:"limit,omitempty"`
+	Before    int    `json:"before,omitempty"`
+}
+
+type MessageHistoryResponse struct {
+	EventType string            `json:"type"`
+	Request   string            `json:"request"`
+	Channel   string            `json:"channel"`
+	Messages  []OutgoingMessage `json:"messages"`
+}
+
 type JoinScreenshareRequest struct {
 	EventType string `json:"type"`
 	User      string `json:"user"`
+}
+
+type TypingIndicator struct {
+	EventType string `json:"type"`
+	Channel   string `json:"channel"`
+}
+
+type EmoteListResponse struct {
+	EventType string  `json:"type"`
+	Emotes    []Emote `json:"emotes"`
+}
+
+type Emote struct {
+	Name string `json:"name"`
+	Data string `json:"data"`
 }
 
 type voiceClient struct {
@@ -73,7 +125,7 @@ type Server struct {
 	// Channel management
 	voiceChannels      map[string]map[string]*voiceClient
 	textChannels       map[string]bool
-	eventStreams       []*quic.Stream
+	eventStreams       map[string]*quic.Stream
 	screenshareStreams map[string]*screenshareClient
 
 	// Authentication
@@ -97,7 +149,7 @@ func NewServer(addr string, db *database.DB) *Server {
 		db:                 db,
 		voiceChannels:      make(map[string]map[string]*voiceClient),
 		textChannels:       make(map[string]bool),
-		eventStreams:       make([]*quic.Stream, 0),
+		eventStreams:       make(map[string]*quic.Stream),
 		screenshareStreams: make(map[string]*screenshareClient),
 		pendingChallenges:  make(map[string][]byte),
 		authenticatedConns: make(map[string]string),
@@ -560,7 +612,7 @@ func (s *Server) handleEventStream(conn *quic.Conn, stream *quic.Stream) {
 	}
 
 	s.mu.Lock()
-	s.eventStreams = append(s.eventStreams, stream)
+	s.eventStreams[connID] = stream
 	s.mu.Unlock()
 
 	if err := s.sendServerInfo(stream); err != nil {
@@ -619,20 +671,48 @@ func (s *Server) processEventMessages(conn *quic.Conn, stream *quic.Stream) {
 		message := string(buf[:n])
 		log.Printf("Read %d bytes from EVENT stream: %s", n, message)
 
+		if message == "hb" {
+			continue
+		}
+
 		s.routeEventMessage(conn, stream, buf[:n])
 	}
 }
 
 func (s *Server) routeEventMessage(conn *quic.Conn, stream *quic.Stream, data []byte) {
-	var adminReq AdminRequest
-	if err := json.Unmarshal(data, &adminReq); err == nil && adminReq.Type == "admin_request" {
-		s.handleAdminRequest(conn, stream, &adminReq)
+	var envelope struct {
+		EventType string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		log.Printf("routeEventMessage: unmarshal error: %v", err)
 		return
 	}
 
-	var joinReq JoinScreenshareRequest
-	if err := json.Unmarshal(data, &joinReq); err == nil && joinReq.EventType == "joinScreenshare" {
+	switch envelope.EventType {
+	case "admin_request":
+		var adminReq AdminRequest
+		_ = json.Unmarshal(data, &adminReq)
+		s.handleAdminRequest(conn, stream, &adminReq)
+	case "Message":
+		var msg IncomingMessage
+		_ = json.Unmarshal(data, &msg)
+		s.handleTextMessage(conn, &msg)
+	case "history_request":
+		var historyReq MessageHistoryRequest
+		_ = json.Unmarshal(data, &historyReq)
+		s.handleMessageHistory(conn, stream, &historyReq)
+	case "joinScreenshare":
+		var joinReq JoinScreenshareRequest
+		_ = json.Unmarshal(data, &joinReq)
 		s.handleJoinScreenshare(conn, &joinReq)
+	case "typing_indicator":
+		var typingInd TypingIndicator
+		_ = json.Unmarshal(data, &typingInd)
+		s.handleTypingIndicator(conn, &typingInd)
+	case "emote_list_request":
+		s.handleEmoteListRequest(conn, stream)
+	default:
+		log.Printf("routeEventMessage: unknown event type: %s", envelope.EventType)
 	}
 }
 
@@ -746,7 +826,7 @@ func (s *Server) handleApproveUser(stream *quic.Stream, adminReq *AdminRequest) 
 	response := AdminResponse{
 		EventType: "admin_response",
 		Request:   adminReq.Request,
-		Data:      map[string]interface{}{"user_id": adminReq.UserID, "status": "approved"},
+		Data:      map[string]any{"user_id": adminReq.UserID, "status": "approved"},
 	}
 
 	s.sendAdminResponse(stream, &response)
@@ -881,11 +961,12 @@ func (s *Server) sendOkMessage(stream *quic.Stream) {
 func (s *Server) broadcastVoiceToChannel(channel, sender string, data []byte) {
 	// add data length to the packet
 	packetLen := len(data)
+	if packetLen > math.MaxUint32 {
+		log.Printf("broadcastVoiceToChannel: packet too large: %d bytes", packetLen)
+		return
+	}
 	packet := make([]byte, 4+packetLen)
-	packet[0] = byte(packetLen)
-	packet[1] = byte(packetLen >> 8)
-	packet[2] = byte(packetLen >> 16)
-	packet[3] = byte(packetLen >> 24)
+	binary.LittleEndian.PutUint32(packet[:4], uint32(packetLen))
 	copy(packet[4:], data)
 
 	s.mu.RLock()
@@ -975,6 +1056,7 @@ func (s *Server) cleanupConnection(connID string) {
 	delete(s.authenticatedConns, connID)
 	delete(s.connPublicKeys, connID)
 	delete(s.pendingChallenges, connID)
+	delete(s.eventStreams, connID)
 	s.mu.Unlock()
 
 	if wasAuthenticated {
@@ -1004,6 +1086,28 @@ func (s *Server) removeUserFromAllChannels(username string) {
 	}
 }
 
+func (s *Server) broadcastToEventStreams(data []byte) {
+	s.broadcastToEventStreamsExcept("", data)
+}
+
+func (s *Server) broadcastToEventStreamsExcept(excludeConnID string, data []byte) {
+	s.mu.RLock()
+	streams := make(map[string]*quic.Stream, len(s.eventStreams))
+	for id, stream := range s.eventStreams {
+		streams[id] = stream
+	}
+	s.mu.RUnlock()
+	for connID, stream := range streams {
+		if connID == excludeConnID {
+			continue
+		}
+		_ = (*stream).SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := (*stream).Write(data); err != nil {
+			log.Printf("broadcastToEventStreams: write error: %v", err)
+		}
+	}
+}
+
 func (s *Server) broadcastEvent(event UserAction) {
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -1011,14 +1115,221 @@ func (s *Server) broadcastEvent(event UserAction) {
 		return
 	}
 	data = append(data, '\n')
+	s.broadcastToEventStreams(data)
+}
+
+func (s *Server) handleTypingIndicator(conn *quic.Conn, ind *TypingIndicator) {
+	connID := fmt.Sprintf("%p", conn)
 	s.mu.RLock()
-	streams := make([]*quic.Stream, len(s.eventStreams))
-	copy(streams, s.eventStreams)
+	username, authenticated := s.authenticatedConns[connID]
 	s.mu.RUnlock()
-	for _, stream := range streams {
-		_ = (*stream).SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-		if _, err := (*stream).Write(data); err != nil {
-			log.Printf("broadcastEvent: write error: %v", err)
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection sent typing indicator")
+		return
+	}
+
+	data, err := json.Marshal(UserAction{
+		EventType: "typing_indicator",
+		User:      username,
+		Channel:   ind.Channel,
+	})
+	if err != nil {
+		log.Printf("handleTypingIndicator: marshal error: %v", err)
+		return
+	}
+	data = append(data, '\n')
+	s.broadcastToEventStreamsExcept(connID, data)
+}
+
+func (s *Server) handleTextMessage(conn *quic.Conn, msg *IncomingMessage) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	username, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to send message")
+		return
+	}
+
+	if msg.Content == "" {
+		log.Printf("Empty message content from user %s", username)
+		return
+	}
+
+	s.mu.RLock()
+	_, exists := s.textChannels[msg.Channel]
+	s.mu.RUnlock()
+
+	if !exists {
+		log.Printf("Text channel not found: %s", msg.Channel)
+		return
+	}
+
+	savedMsg, err := s.db.SaveMessage(msg.Channel, username, msg.Content, msg.Compressed)
+	if err != nil {
+		log.Printf("Failed to save message: %v", err)
+		return
+	}
+
+	outgoing := OutgoingMessage{
+		EventType:  "Message",
+		Channel:    savedMsg.Channel,
+		Content:    savedMsg.Content,
+		Compressed: savedMsg.Compressed,
+		User:       savedMsg.User,
+		Timestamp:  savedMsg.CreatedAt,
+		ID:         savedMsg.ID,
+	}
+
+	data, err := json.Marshal(outgoing)
+	if err != nil {
+		log.Printf("Failed to marshal outgoing message: %v", err)
+		return
+	}
+	data = append(data, '\n')
+	s.broadcastToEventStreams(data)
+
+	log.Printf("Message from %s in %s (id=%d)", username, msg.Channel, savedMsg.ID)
+}
+
+func (s *Server) handleMessageHistory(conn *quic.Conn, stream *quic.Stream, req *MessageHistoryRequest) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	_, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to request message history")
+		return
+	}
+
+	if req.Channel == "" {
+		log.Printf("Empty channel in history request")
+		return
+	}
+
+	messages, err := s.db.GetMessages(req.Channel, req.Limit, req.Before)
+	if err != nil {
+		log.Printf("Failed to get messages for channel %s: %v", req.Channel, err)
+		return
+	}
+
+	outMsgs := make([]OutgoingMessage, len(messages))
+	for i, m := range messages {
+		outMsgs[i] = OutgoingMessage{
+			EventType:  "Message",
+			Channel:    m.Channel,
+			Content:    m.Content,
+			Compressed: m.Compressed,
+			User:       m.User,
+			Timestamp:  m.CreatedAt,
+			ID:         m.ID,
 		}
 	}
+
+	response := MessageHistoryResponse{
+		EventType: "history_response",
+		Request:   "get_messages",
+		Channel:   req.Channel,
+		Messages:  outMsgs,
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Failed to marshal history response: %v", err)
+		return
+	}
+	jsonData = append(jsonData, '\n')
+
+	if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("Error setting write deadline for history response: %v", err)
+		return
+	}
+	if _, err := stream.Write(jsonData); err != nil {
+		log.Printf("Error writing history response: %v", err)
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+
+	log.Printf("Sent %d messages history for channel %s", len(outMsgs), req.Channel)
+}
+
+func (s *Server) handleEmoteListRequest(conn *quic.Conn, stream *quic.Stream) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	_, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection requested emote list")
+		return
+	}
+
+	emotesDir := filepath.Join(GetDataDir(), "emotes")
+	emoteFS := os.DirFS(emotesDir)
+	entries, err := fs.ReadDir(emoteFS, ".")
+	if err != nil {
+		log.Printf("Failed to read emotes directory: %v", err)
+		s.sendEmoteListResponse(stream, nil)
+		return
+	}
+
+	var emotes []Emote
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		emoteName := strings.TrimSuffix(name, ext)
+
+		switch strings.ToLower(ext) {
+		case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		default:
+			continue
+		}
+
+		data, err := fs.ReadFile(emoteFS, name)
+		if err != nil {
+			log.Printf("Failed to read emote file %s: %v", name, err)
+			continue
+		}
+
+		emotes = append(emotes, Emote{
+			Name: emoteName,
+			Data: base64.StdEncoding.EncodeToString(data),
+		})
+	}
+
+	s.sendEmoteListResponse(stream, emotes)
+	log.Printf("Sent %d emotes to client", len(emotes))
+}
+
+func (s *Server) sendEmoteListResponse(stream *quic.Stream, emotes []Emote) {
+	if emotes == nil {
+		emotes = []Emote{}
+	}
+
+	response := EmoteListResponse{
+		EventType: "emote_list_response",
+		Emotes:    emotes,
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Failed to marshal emote list response: %v", err)
+		return
+	}
+	jsonData = append(jsonData, '\n')
+
+	if err := stream.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Printf("Error setting write deadline for emote response: %v", err)
+		return
+	}
+	if _, err := stream.Write(jsonData); err != nil {
+		log.Printf("Error writing emote list response: %v", err)
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
 }
