@@ -699,19 +699,34 @@ func (s *Server) routeEventMessage(conn *quic.Conn, stream *quic.Stream, data []
 		return
 	}
 
+	if s.routeClientEvent(conn, data, envelope.EventType) {
+		return
+	}
+
 	switch envelope.EventType {
 	case "admin_request":
 		var adminReq AdminRequest
 		_ = json.Unmarshal(data, &adminReq)
 		s.handleAdminRequest(conn, stream, &adminReq)
-	case "Message":
-		var msg IncomingMessage
-		_ = json.Unmarshal(data, &msg)
-		s.handleTextMessage(conn, &msg)
 	case "history_request":
 		var historyReq MessageHistoryRequest
 		_ = json.Unmarshal(data, &historyReq)
 		s.handleMessageHistory(conn, stream, &historyReq)
+	case "emote_list_request":
+		s.handleEmoteListRequest(conn, stream)
+	case "user_list_request":
+		s.handleUserListRequest(conn, stream)
+	default:
+		log.Printf("routeEventMessage: unknown event type: %s", envelope.EventType)
+	}
+}
+
+func (s *Server) routeClientEvent(conn *quic.Conn, data []byte, eventType string) bool {
+	switch eventType {
+	case "Message":
+		var msg IncomingMessage
+		_ = json.Unmarshal(data, &msg)
+		s.handleTextMessage(conn, &msg)
 	case "joinScreenshare":
 		var joinReq JoinScreenshareRequest
 		_ = json.Unmarshal(data, &joinReq)
@@ -720,13 +735,12 @@ func (s *Server) routeEventMessage(conn *quic.Conn, stream *quic.Stream, data []
 		var typingInd TypingIndicator
 		_ = json.Unmarshal(data, &typingInd)
 		s.handleTypingIndicator(conn, &typingInd)
-	case "emote_list_request":
-		s.handleEmoteListRequest(conn, stream)
-	case "user_list_request":
-		s.handleUserListRequest(conn, stream)
+	case "leaveVoice":
+		s.handleLeaveVoice(conn)
 	default:
-		log.Printf("routeEventMessage: unknown event type: %s", envelope.EventType)
+		return false
 	}
+	return true
 }
 
 func (s *Server) handleAdminRequest(conn *quic.Conn, stream *quic.Stream, adminReq *AdminRequest) {
@@ -1144,6 +1158,43 @@ func (s *Server) broadcastEvent(event UserAction) {
 	}
 	data = append(data, '\n')
 	s.broadcastToEventStreams(data)
+}
+
+func (s *Server) handleLeaveVoice(conn *quic.Conn) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	username, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection attempted to leave voice channel")
+		return
+	}
+
+	s.mu.RLock()
+	var channels []string
+	for ch, clients := range s.voiceChannels {
+		if _, ok := clients[username]; ok {
+			channels = append(channels, ch)
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(channels) == 0 {
+		log.Printf("User %s is not in any voice channel", username)
+		return
+	}
+
+	for _, channel := range channels {
+		s.removeVoiceClient(channel, username)
+		log.Printf("User %s left voice channel %s via event stream", username, channel)
+
+		go s.broadcastEvent(UserAction{
+			EventType: "UserLeave",
+			User:      username,
+			Channel:   channel,
+		})
+	}
 }
 
 func (s *Server) handleTypingIndicator(conn *quic.Conn, ind *TypingIndicator) {
