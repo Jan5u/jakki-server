@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -94,9 +95,21 @@ type TypingIndicator struct {
 	Channel   string `json:"channel"`
 }
 
+type UserStatusChange struct {
+	EventType string `json:"type"`
+	User      string `json:"user"`
+	Status    string `json:"status"`
+}
+
 type EmoteListResponse struct {
 	EventType string  `json:"type"`
 	Emotes    []Emote `json:"emotes"`
+}
+
+type UserListResponse struct {
+	EventType string   `json:"type"`
+	Online    []string `json:"online"`
+	Offline   []string `json:"offline"`
 }
 
 type Emote struct {
@@ -426,6 +439,8 @@ func (s *Server) handleAuthStream(conn *quic.Conn, stream *quic.Stream) {
 	if _, err := stream.Write([]byte("ok")); err != nil {
 		log.Printf("Failed to send ok response: %v", err)
 	}
+
+	go s.broadcastStatusChange(username, "online")
 }
 
 func (s *Server) sendAuthChallenge(connID string, stream *quic.Stream) ([]byte, error) {
@@ -660,22 +675,18 @@ func (s *Server) sendServerInfo(stream *quic.Stream) error {
 }
 
 func (s *Server) processEventMessages(conn *quic.Conn, stream *quic.Stream) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := stream.Read(buf)
-		if err != nil {
-			log.Printf("Read error: %v", err)
-			return
-		}
-
-		message := string(buf[:n])
-		log.Printf("Read %d bytes from EVENT stream: %s", n, message)
-
-		if message == "hb" {
+	scanner := bufio.NewScanner(stream)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" || line == "hb" || line == "hello" {
 			continue
 		}
 
-		s.routeEventMessage(conn, stream, buf[:n])
+		s.routeEventMessage(conn, stream, []byte(line))
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Event stream scan error: %v", err)
 	}
 }
 
@@ -711,6 +722,8 @@ func (s *Server) routeEventMessage(conn *quic.Conn, stream *quic.Stream, data []
 		s.handleTypingIndicator(conn, &typingInd)
 	case "emote_list_request":
 		s.handleEmoteListRequest(conn, stream)
+	case "user_list_request":
+		s.handleUserListRequest(conn, stream)
 	default:
 		log.Printf("routeEventMessage: unknown event type: %s", envelope.EventType)
 	}
@@ -1063,6 +1076,7 @@ func (s *Server) cleanupConnection(connID string) {
 		log.Printf("Connection closed for user: %s", username)
 		// Remove user from all voice channels
 		s.removeUserFromAllChannels(username)
+		go s.broadcastStatusChange(username, "offline")
 	}
 }
 
@@ -1106,6 +1120,20 @@ func (s *Server) broadcastToEventStreamsExcept(excludeConnID string, data []byte
 			log.Printf("broadcastToEventStreams: write error: %v", err)
 		}
 	}
+}
+
+func (s *Server) broadcastStatusChange(username, status string) {
+	data, err := json.Marshal(UserStatusChange{
+		EventType: "user_status_change",
+		User:      username,
+		Status:    status,
+	})
+	if err != nil {
+		log.Printf("broadcastStatusChange: marshal error: %v", err)
+		return
+	}
+	data = append(data, '\n')
+	s.broadcastToEventStreams(data)
 }
 
 func (s *Server) broadcastEvent(event UserAction) {
@@ -1305,6 +1333,73 @@ func (s *Server) handleEmoteListRequest(conn *quic.Conn, stream *quic.Stream) {
 
 	s.sendEmoteListResponse(stream, emotes)
 	log.Printf("Sent %d emotes to client", len(emotes))
+}
+
+func (s *Server) handleUserListRequest(conn *quic.Conn, stream *quic.Stream) {
+	connID := fmt.Sprintf("%p", conn)
+	s.mu.RLock()
+	_, authenticated := s.authenticatedConns[connID]
+	s.mu.RUnlock()
+
+	if !authenticated {
+		log.Printf("Unauthenticated connection requested user list")
+		return
+	}
+
+	users, err := s.db.GetAllUsers()
+	if err != nil {
+		log.Printf("Failed to get users for user list: %v", err)
+		return
+	}
+
+	online, offline := s.buildUserList(users)
+
+	response := UserListResponse{
+		EventType: "user_list",
+		Online:    online,
+		Offline:   offline,
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Failed to marshal user list response: %v", err)
+		return
+	}
+	jsonData = append(jsonData, '\n')
+
+	if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		log.Printf("Error setting write deadline for user list response: %v", err)
+		return
+	}
+	if _, err := stream.Write(jsonData); err != nil {
+		log.Printf("Error writing user list response: %v", err)
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+
+	log.Printf("Sent user list: %d online, %d offline", len(online), len(offline))
+}
+
+func (s *Server) buildUserList(users []database.User) (online, offline []string) {
+	s.mu.RLock()
+	onlineSet := make(map[string]bool, len(s.authenticatedConns))
+	for _, username := range s.authenticatedConns {
+		onlineSet[username] = true
+	}
+	s.mu.RUnlock()
+
+	online = []string{}
+	offline = []string{}
+	for _, u := range users {
+		if !u.IsApproved {
+			continue
+		}
+		if onlineSet[u.Username] {
+			online = append(online, u.Username)
+		} else {
+			offline = append(offline, u.Username)
+		}
+	}
+	return online, offline
 }
 
 func (s *Server) sendEmoteListResponse(stream *quic.Stream, emotes []Emote) {
